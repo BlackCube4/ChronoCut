@@ -183,8 +183,23 @@
 
     <div class="spacer"></div>
 
-    <!-- Bottom Button Group: two-step edits (detect → confirm) with feedback -->
+    <!-- Bottom Button Group: two-step edits (detect → confirm) with feedback.
+         Autopilot on top runs all of them in this same order with one click. -->
     <div class="button-group bottom-buttons" ref="bottomButtonsRef">
+      <button
+        class="sidebar-btn autopilot-btn"
+        :disabled="isLoading || autopilot.busy"
+        :title="t('tipAutopilot')"
+        @click="onAutopilotClick"
+      >
+        <span v-if="autopilot.busy" class="btn-spinner"></span>
+        <svg v-else class="autopilot-icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"
+             fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 19 L15 9" /><path d="M14 4 l1 2.5 L17.5 7.5 L15 8.5 L14 11 L13 8.5 L10.5 7.5 L13 6.5 Z" />
+          <path d="M19 13 l.6 1.4 L21 15 l-1.4 .6 L19 17 l-.6-1.4 L17 15 l1.4-.6 Z" />
+        </svg>
+        <span class="btn-text">{{ autopilot.flash || t('autopilot') }}</span>
+      </button>
       <button
         v-for="a in EDIT_ACTIONS"
         :key="a"
@@ -447,22 +462,38 @@ const uploadFile = async (file) => {
 // elsewhere cancels an armed action; a spinner shows while the viewer works.
 const bottomButtonsRef = ref(null)
 
-const EDIT_ACTIONS = ['doubles', 'colors', 'white', 'tinysegs']
+// In the order they're usually needed - and the order the Autopilot runs them
+// in (ThreeViewer AUTOPILOT_STEPS must match): strip what doesn't belong first
+// (watermark, white), then fix colours so the overlap check sees the real
+// cut/engrave split, drop extraction noise, remove overlaps, and only then join
+// - Remove Doubles rebuilds lines and would split joined paths again.
+const EDIT_ACTIONS = ['watermarks', 'white', 'colors', 'tinysegs', 'doubles', 'joincurves']
 const EDIT_TIP = {
   doubles: 'tipRemoveDoubles', colors: 'tipFixColors', white: 'tipRemoveWhite', tinysegs: 'tipRemoveTinySegs',
+  joincurves: 'tipJoinCurves', watermarks: 'tipRemoveWatermarks',
 }
 const EDIT_CFG = {
-  doubles:  { idle: 'removeDoubles',  armed: 'doublesArmedN',  none: 'noDoubles',    done: 'doublesDone' },
-  colors:   { idle: 'fixColors',      armed: 'colorsArmedN',   none: 'colorsNone',   done: 'colorsDone' },
-  white:    { idle: 'removeWhite',    armed: 'whiteArmedN',    none: 'whiteNone',    done: 'whiteDone' },
-  tinysegs: { idle: 'removeTinySegs', armed: 'tinySegsArmedN', none: 'tinySegsNone', done: 'tinySegsDone' },
+  doubles:    { idle: 'removeDoubles',    armed: 'doublesArmedN',     none: 'noDoubles',        done: 'doublesDone' },
+  colors:     { idle: 'fixColors',        armed: 'colorsArmedN',      none: 'colorsNone',       done: 'colorsDone' },
+  white:      { idle: 'removeWhite',      armed: 'whiteArmedN',       none: 'whiteNone',        done: 'whiteDone' },
+  watermarks: { idle: 'removeWatermarks', armed: 'watermarksArmedN',  none: 'watermarksNone',   done: 'watermarksDone' },
+  tinysegs:   { idle: 'removeTinySegs',   armed: 'tinySegsArmedN',    none: 'tinySegsNone',     done: 'tinySegsDone' },
+  joincurves: { idle: 'joinCurves',       armed: 'joinCurvesArmedN',  none: 'joinCurvesNone',   done: 'joinCurvesDone' },
 }
 const editState = reactive({
-  doubles:  { armed: false, busy: false, count: 0, flash: '' },
-  colors:   { armed: false, busy: false, count: 0, flash: '' },
-  white:    { armed: false, busy: false, count: 0, flash: '' },
-  tinysegs: { armed: false, busy: false, count: 0, flash: '' },
+  doubles:    { armed: false, busy: false, count: 0, flash: '' },
+  colors:     { armed: false, busy: false, count: 0, flash: '' },
+  white:      { armed: false, busy: false, count: 0, flash: '' },
+  watermarks: { armed: false, busy: false, count: 0, flash: '' },
+  tinysegs:   { armed: false, busy: false, count: 0, flash: '' },
+  joincurves: { armed: false, busy: false, count: 0, flash: '' },
 })
+
+// m:ss (or h:mm:ss) for the "Kurven verbinden" result text.
+const fmtSaved = (sec) => {
+  const s = Math.round(sec), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`
+}
 
 const editLabel = (a) => {
   const s = editState[a], cfg = EDIT_CFG[a]
@@ -483,9 +514,9 @@ const cancelArmed = (keep = null) => {
   if (cleared) eventBus.emit('edit-cancel')
 }
 
-const flashEdit = (a, text) => {
+const flashEdit = (a, text, ms = 1500) => {
   editState[a].flash = text
-  setTimeout(() => { editState[a].flash = '' }, 1500)
+  setTimeout(() => { editState[a].flash = '' }, ms)
 }
 
 const onEditClick = (a) => {
@@ -501,20 +532,55 @@ const onEditClick = (a) => {
   }
 }
 
-const onEditResult = ({ action, count, phase }) => {
+const onEditResult = ({ action, count, phase, paths, saved, autopilot: auto }) => {
   const s = editState[action], cfg = EDIT_CFG[action]
   s.busy = false
+  // After an Autopilot run every button shows its own result for a while, so
+  // you can read off what each step did.
+  const ms = auto ? 5000 : 1500
   if (phase === 'detect') {
     if (count > 0) { s.armed = true; s.count = count }
     else { s.armed = false; flashEdit(action, t(cfg.none)) }
+  } else if (action === 'joincurves' && count > 0) {
+    // Show what it bought: the time saved on the current settings. With
+    // "Optimieren" on that is ~0 (the machine already drives through), so then
+    // just the path count - the tooltip explains why.
+    s.armed = false; s.count = 0
+    flashEdit(action, saved >= 1
+      ? t('joinCurvesDoneSaved', { n: paths, t: fmtSaved(saved) })
+      : t('joinCurvesDone', { n: paths }), 5000)
   } else {                                // applied
     s.armed = false; s.count = 0
-    flashEdit(action, count > 0 ? t(cfg.done) : t(cfg.none))
+    flashEdit(action, count > 0 ? t(cfg.done) : t(cfg.none), ms)
   }
+}
+
+// ── Autopilot: every edit above, in order, with one click ────────────────────
+// No detect/confirm step - that's the point of it. The viewer runs all steps on
+// the data in one go (ThreeViewer handleAutopilot) and reports each step as a
+// normal 'edit-result' plus one 'autopilot-result' summary.
+const autopilot = reactive({ busy: false, flash: '' })
+
+const onAutopilotClick = () => {
+  if (autopilot.busy) return
+  cancelArmed()
+  autopilot.busy = true
+  setTimeout(() => eventBus.emit('edit-autopilot'), 0)   // defer so the spinner paints first
+}
+
+const onAutopilotResult = ({ changed, total, saved }) => {
+  autopilot.busy = false
+  autopilot.flash = changed === 0
+    ? t('autopilotNone')
+    : saved >= 1
+      ? t('autopilotDoneSaved', { n: changed, m: total, t: fmtSaved(saved) })
+      : t('autopilotDone', { n: changed, m: total })
+  setTimeout(() => { autopilot.flash = '' }, 5000)
 }
 
 const resetEdits = () => {
   for (const a of EDIT_ACTIONS) Object.assign(editState[a], { armed: false, busy: false, count: 0, flash: '' })
+  Object.assign(autopilot, { busy: false, flash: '' })
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -532,6 +598,7 @@ onMounted(async () => {
   document.addEventListener('pointerdown', handleDocClick, true)
   document.addEventListener('keydown', onCustomSpeedsKeydown, true)
   eventBus.on('edit-result', onEditResult)
+  eventBus.on('autopilot-result', onAutopilotResult)
   const { printers } = await loadProfiles()
   cutters.value = printers
   // The awaits above already defer past ThreeViewer's onMounted, so its listeners
@@ -544,6 +611,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocClick, true)
   document.removeEventListener('keydown', onCustomSpeedsKeydown, true)
   eventBus.off('edit-result', onEditResult)
+  eventBus.off('autopilot-result', onAutopilotResult)
 })
 </script>
 
@@ -883,6 +951,19 @@ onBeforeUnmount(() => {
 }
 .sidebar-btn.armed .btn-text { color: #c800c8; font-weight: 600; }
 .btn-text { flex: 1; text-align: left; color: var(--text-strong); }
+
+/* Autopilot: the one accent button in the edit group (same teal as the
+   download button), set slightly apart from the single steps below it. */
+.autopilot-btn {
+  margin-bottom: 4px;
+  background: #00ADC6;
+  border-color: #00ADC6;
+  color: #fff;
+}
+.autopilot-btn:hover:not(:disabled) { background: #0093A8; }
+.autopilot-btn .btn-text { color: #fff; font-weight: 600; }
+.autopilot-icon { display: block; flex-shrink: 0; }
+.autopilot-btn .btn-spinner { border-color: rgba(255, 255, 255, 0.4); border-top-color: #fff; }
 
 /* Small spinner shown while an edit is detecting/applying. */
 .btn-spinner {

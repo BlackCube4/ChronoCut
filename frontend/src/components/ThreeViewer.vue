@@ -28,9 +28,10 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import * as THREE from 'three'
 import eventBus from '../eventBus'
-import { buildToolpath, isGreen, isRasterColor, categorize, SPEED_MM_S, fixColors, computeDoubleRemoval, rotateData, removeWhite, detectFixColors, detectRemoveWhite, detectTinySegments, removeTinySegments, rampSegments, annotateRuns, movePolyline, accelFor, cornerPenaltyFor, moveExtraTime, DEFAULT_PATH_ORDER, dist, setTessellationTolerance, RASTER_BITMAP_MARK } from '../toolpath'
+import { buildToolpath, isGreen, isRasterColor, categorize, SPEED_MM_S, fixColors, computeDoubleRemoval, rotateData, removeWhite, detectFixColors, detectRemoveWhite, detectTinySegments, removeTinySegments, detectJoinCurves, joinCurves, detectWatermarks, removeWatermarks, alignTopLeft, rampSegments, annotateRuns, movePolyline, accelFor, cornerPenaltyFor, forcedStopsFor, moveExtraTime, DEFAULT_PATH_ORDER, dist, setTessellationTolerance, RASTER_BITMAP_MARK } from '../toolpath'
 import { getStoredDark } from '../theme'
 import { getStoredViewSettings, TESSELLATION_TOL_BY_KEY } from '../viewSettings'
+import { ensureImageInk, getImageInk, grayImageUrl } from '../imageInk'
 
 // Restored once here (module scope, evaluated on first import) rather than
 // read individually per variable below - same "self-source on mount, don't
@@ -71,6 +72,9 @@ let showTravel   = restoredViewSettings.showTravel   // draw the dotted "Leerweg
 let speedGradient = restoredViewSettings.speedGradient // debug: colour segments by speed (accel debugging)
 let lineMaterial = null    // toolpath line material (for live travel show/hide)
 let showRulers   = restoredViewSettings.showRulers   // CAD-style rulers along the top + left edges (mm)
+let imagesGray   = restoredViewSettings.imagesGray   // show images in grayscale, the way the laser engraves them
+const grayReady = new Map()      // image data URL -> grayscale data URL (imageInk.js grayImageUrl)
+const grayPending = new Set()
 let lastRulerSig = ''      // redraw the rulers only when the view actually changes
 let tinyBoxes = []         // bounding boxes of parts small enough to fall through the grid
 let showTinyHighlight = false  // highlight those parts in the viewer (on demand)
@@ -468,6 +472,28 @@ const handleLinesUpdate = (lines) => {
   contentBox = computeContentBBox(lines)
   frameBox(contentBox || bedBox())
   checkFit()
+  // Images first count with their whole rectangle; once their pixels are
+  // analysed (imageInk.js) only the inked rows/spans do - rebuild then, unless
+  // another file has been loaded meanwhile.
+  ensureImageInk(lines).then((changed) => {
+    if (!changed || !currentData) return
+    if (currentData !== lines && !sameUpload(lines)) return
+    drawObjects(currentData)
+  })
+}
+
+// Edits replace currentData with a new array but keep its image objects' data
+// URLs; a different upload has different ones (or none).
+const sameUpload = (lines) => {
+  const urls = new Set(lines.filter((o) => o.type === 'img').map((o) => o.data))
+  return currentData.some((o) => o.type === 'img' && urls.has(o.data))
+}
+
+// Toggle: show images in grayscale - what the driver actually engraves (darker
+// burns more). Colour images otherwise look like they keep their colours.
+const handleImagesGrayChanged = (on) => {
+  imagesGray = !!on
+  if (currentData) drawObjects(currentData)
 }
 
 // Reset the view: re-centre + re-fit, flown to rather than snapped to.
@@ -525,6 +551,28 @@ const lasedBox = (t) => {
     if (b.maxY > maxY) maxY = b.maxY
   }
   return isFinite(minX) ? { minX, minY, maxX, maxY } : null
+}
+
+// ── Which time the UI shows ──────────────────────────────────────────────────
+// buildToolpath returns BOTH: stats.displayTime is what the Job Manager puts on
+// screen, stats.totalTime how long the machine actually takes (calibration.js
+// REALITY). Everything downstream reads stats.totalTime, so the switch happens
+// here, once - no consumer needs to know there are two numbers.
+let lastStats = null
+let showMachineEstimate = !!restoredViewSettings.showMachineEstimate
+
+const shownTime = () => (showMachineEstimate
+  ? (lastStats.displayTime ?? lastStats.totalTime)
+  : lastStats.totalTime)
+
+const publishStats = () => {
+  if (!lastStats) return
+  eventBus.emit('toolpath-stats', { ...lastStats, totalTime: shownTime() })
+}
+
+const handleTimeBasisChanged = (on) => {
+  showMachineEstimate = !!on
+  publishStats()
 }
 
 // ── Per-colour visibility (breakdown panel's eye buttons) ─────────────────────
@@ -614,35 +662,93 @@ const handleEditDetect = ({ action }) => {
   else if (action === 'colors')  { const r = detectFixColors(currentData);      segs = r.segs;    count = r.count }
   else if (action === 'white')   { const r = detectRemoveWhite(currentData);     segs = r.segs;    count = r.count }
   else if (action === 'tinysegs') { const r = detectTinySegments(currentData);   segs = r.segs;    count = r.count }
+  else if (action === 'joincurves') { const r = detectJoinCurves(currentData);  segs = r.segs;    count = r.count }
+  else if (action === 'watermarks') { const r = detectWatermarks(currentData);  segs = r.segs;    count = r.count }
   drawHighlight(segs)
   eventBus.emit('edit-result', { action, count, phase: 'detect' })
 }
 
-const handleEditApply = ({ action }) => {
-  if (!currentData) { eventBus.emit('edit-result', { action, count: 0, phase: 'applied' }); return }
-  let count = 0
+// One edit on `data`, no drawing. Returns { data, count, paths? } - `data` is
+// the input itself when nothing changed. Shared by the single buttons and the
+// Autopilot, so both do exactly the same thing.
+const runEdit = (action, data) => {
   if (action === 'doubles') {
-    const { data, removed } = computeDoubleRemoval(currentData)
-    count = removed.length
-    if (count > 0) currentData = data
-  } else if (action === 'colors') {
-    const fixed = fixColors(currentData)
-    for (let i = 0; i < fixed.length; i++) if (fixed[i] !== currentData[i]) count++
-    if (count > 0) currentData = fixed
-  } else if (action === 'white') {
-    const before = currentData.length
-    currentData = removeWhite(currentData)
-    count = before - currentData.length
-  } else if (action === 'tinysegs') {
-    const before = currentData.length
-    currentData = removeTinySegments(currentData)
-    count = before - currentData.length
+    const r = computeDoubleRemoval(data)
+    return r.removed.length ? { data: r.data, count: r.removed.length } : { data, count: 0 }
   }
+  if (action === 'colors') {
+    const fixed = fixColors(data)
+    let count = 0
+    for (let i = 0; i < fixed.length; i++) if (fixed[i] !== data[i]) count++
+    return { data: count ? fixed : data, count }
+  }
+  if (action === 'white') {
+    const d = removeWhite(data)
+    return { data: d, count: data.length - d.length }
+  }
+  if (action === 'tinysegs') {
+    const d = removeTinySegments(data)
+    return { data: d, count: data.length - d.length }
+  }
+  if (action === 'watermarks') return removeWatermarks(data)   // also re-aligns to 5 mm
+  if (action === 'joincurves') return joinCurves(data)
+  return { data, count: 0 }
+}
+
+// Redraw after edits; `reframe` when the drawing may have moved (watermark
+// removal re-aligns it to the top-left corner).
+const afterEdit = (reframe) => {
   clearHighlight()
   drawObjects(currentData)
   contentBox = computeContentBBox(currentData)
+  if (reframe) frameBox(contentBox || bedBox())
   checkFit()
-  eventBus.emit('edit-result', { action, count, phase: 'applied' })
+}
+
+const handleEditApply = ({ action }) => {
+  if (!currentData) { eventBus.emit('edit-result', { action, count: 0, phase: 'applied' }); return }
+  const timeBefore = lastStats ? shownTime() : 0
+  const r = runEdit(action, currentData)
+  currentData = r.data
+  afterEdit(action === 'watermarks' && r.count > 0)
+  // Kurven verbinden also reports how many paths came out and how much time it
+  // saves on the CURRENT settings - with "Optimieren" off that is the whole
+  // point, with it on the machine already drives through and the gain is ~0.
+  const extra = action === 'joincurves'
+    ? { paths: r.paths, saved: lastStats ? Math.max(0, timeBefore - shownTime()) : 0 }
+    : {}
+  eventBus.emit('edit-result', { action, count: r.count, phase: 'applied', ...extra })
+}
+
+// ── Autopilot: all edits in a row, one click ─────────────────────────────────
+// Same order as the sidebar buttons (Sidebar.vue EDIT_ACTIONS explains why).
+// If a watermark came off, the drawing is re-aligned once more at the end: a
+// later step (e.g. Remove White) may have taken away the outermost object.
+const AUTOPILOT_STEPS = ['watermarks', 'white', 'colors', 'tinysegs', 'doubles', 'joincurves']
+
+const handleAutopilot = () => {
+  if (!currentData) {
+    eventBus.emit('autopilot-result', { changed: 0, total: AUTOPILOT_STEPS.length, saved: 0 })
+    return
+  }
+  const timeBefore = lastStats ? shownTime() : 0
+  let data = currentData
+  const results = []
+  for (const action of AUTOPILOT_STEPS) {
+    const r = runEdit(action, data)
+    data = r.data
+    results.push({ action, count: r.count, paths: r.paths })
+  }
+  const wmRemoved = results[0].count > 0
+  if (wmRemoved) data = alignTopLeft(data)
+  currentData = data
+  afterEdit(wmRemoved)
+  for (const r of results) eventBus.emit('edit-result', { ...r, phase: 'applied', autopilot: true })
+  eventBus.emit('autopilot-result', {
+    changed: results.filter((r) => r.count > 0).length,
+    total: AUTOPILOT_STEPS.length,
+    saved: lastStats ? Math.max(0, timeBefore - shownTime()) : 0,
+  })
 }
 
 const handleEditCancel = () => clearHighlight()
@@ -905,14 +1011,29 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
       }
     } else if (obj.type === 'img') {
       if (hiddenKinds.has('raster')) return   // images are always raster-engraved content
-      const texture = new THREE.TextureLoader().load(obj.data)
+      // Grayscale view: use the converted copy once it exists; the first time,
+      // convert in the background and rebuild when it's ready.
+      let url = obj.data
+      if (imagesGray) {
+        const g = grayReady.get(obj.data)
+        if (g) url = g
+        else if (!grayPending.has(obj.data)) {
+          grayPending.add(obj.data)
+          grayImageUrl(obj.data).then((gu) => {
+            grayReady.set(obj.data, gu)
+            if (imagesGray && currentData) drawObjects(currentData)
+          }).catch((e) => console.warn('[viewer] grayscale conversion failed:', e))
+        }
+      }
+      const texture = new THREE.TextureLoader().load(url)
       // obj.x/obj.y is the top-left corner (x right, y down as negative). When the
       // design was rotated, obj.rot says by how much; the plane keeps the image's
       // own dimensions and the mesh is rotated to fill the (swapped) footprint.
       const r = (((obj.rot || 0) % 360) + 360) % 360
       const swap = r === 90 || r === 270
       const geo = new THREE.PlaneGeometry(swap ? obj.h : obj.w, swap ? obj.w : obj.h)
-      const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: false })
+      // obj.alpha: the extraction applied the PDF's soft mask (transparent PNG).
+      const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: !!obj.alpha })
       const mesh = new THREE.Mesh(geo, mat)
       mesh.position.set(obj.x + obj.w / 2, obj.y - obj.h / 2, obj.is_background ? -0.1 : 0.01)
       if (r) mesh.rotation.z = r * Math.PI / 180
@@ -921,7 +1042,7 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
   })
 
   // ── Toolpath: ordered machine moves (engrave → cut, optional optimise) ────
-  const { moves, stats, tinyBoxes: tb } = buildToolpath(data, { optimize: optimizePath, speeds: currentSpeeds, rasterPitch: currentRasterPitch, accel: currentAccel })
+  const { moves, stats, tinyBoxes: tb } = buildToolpath(data, { optimize: optimizePath, speeds: currentSpeeds, rasterPitch: currentRasterPitch, accel: currentAccel, imageInk: getImageInk })
   tinyBoxes = tb || []
 
   // Expand moves into one ordered segment stream. The GEOMETRY stays minimal:
@@ -1010,8 +1131,10 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
     if (pts.length < 2) continue
     // annotateRuns splits the polyline at sharp corners (raster turnarounds, the
     // 90° step between scan rows) and returns, per segment, its position in the
-    // run's velocity profile (s0/s1/S) plus its duration.
-    const ann = annotateRuns(pts, speed, accelFor(m, currentAccel), cornerPenaltyFor(m))
+    // run's velocity profile (s0/s1/S) plus its duration. With "Optimieren" off
+    // every straight-line vertex is a stop too (forcedStopsFor), same as the stats.
+    const ann = annotateRuns(pts, speed, accelFor(m, currentAccel), cornerPenaltyFor(m),
+                             isTravel ? null : forcedStopsFor(m))
     const moveStart = runTime
     const baseRgb = lineRGB(m.color)
 
@@ -1270,7 +1393,8 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
   emitTick()
 
   // Publish stats (incl. segment count for the debug overlay).
-  eventBus.emit('toolpath-stats', { ...stats, optimized: optimizePath, segments: segCount })
+  lastStats = { ...stats, optimized: optimizePath, segments: segCount }
+  publishStats()
 
   console.log(`Toolpath: ${moves.length} moves, ${segCount} segments - `
             + `cut ${stats.cutLen.toFixed(0)}mm, engrave ${stats.engraveLen.toFixed(0)}mm, `
@@ -1474,14 +1598,17 @@ onMounted(() => {
   eventBus.on('rulers-changed',     handleRulersChanged)
   eventBus.on('tiny-highlight-changed', handleTinyHighlight)
   eventBus.on('reset-view',         handleResetView)
+  eventBus.on('time-basis-changed', handleTimeBasisChanged)
   eventBus.on('kind-visibility-changed', handleKindVisibilityChanged)
   eventBus.on('edit-detect',        handleEditDetect)
   eventBus.on('edit-apply',         handleEditApply)
+  eventBus.on('edit-autopilot',     handleAutopilot)
   eventBus.on('edit-cancel',        handleEditCancel)
   eventBus.on('playback_playpause', handlePlayPause)
   eventBus.on('playback_speed',     handleSpeed)
   eventBus.on('playback_seek',      handleSeek)
   eventBus.on('theme-changed',      handleThemeChanged)
+  eventBus.on('images-gray-changed', handleImagesGrayChanged)
 })
 
 onBeforeUnmount(() => {
@@ -1502,14 +1629,17 @@ onBeforeUnmount(() => {
   eventBus.off('rulers-changed',     handleRulersChanged)
   eventBus.off('tiny-highlight-changed', handleTinyHighlight)
   eventBus.off('reset-view',         handleResetView)
+  eventBus.off('time-basis-changed', handleTimeBasisChanged)
   eventBus.off('kind-visibility-changed', handleKindVisibilityChanged)
   eventBus.off('edit-detect',        handleEditDetect)
   eventBus.off('edit-apply',         handleEditApply)
+  eventBus.off('edit-autopilot',     handleAutopilot)
   eventBus.off('edit-cancel',        handleEditCancel)
   eventBus.off('playback_playpause', handlePlayPause)
   eventBus.off('playback_speed',     handleSpeed)
   eventBus.off('playback_seek',      handleSeek)
   eventBus.off('theme-changed',      handleThemeChanged)
+  eventBus.off('images-gray-changed', handleImagesGrayChanged)
   if (renderer) renderer.dispose()
 })
 </script>

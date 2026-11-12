@@ -5,7 +5,8 @@
 // engrave phase before the cut phase, optionally nearest-neighbour optimise the
 // order within each phase, and insert travel ("Leerwege") moves between paths.
 //
-import { CALIBRATION } from './calibration'
+import { CALIBRATION, REALITY, rasterLineOverheadForPct, rasterPctForSpeed }
+  from './calibration'
 
 // Geometry is kept as PRIMITIVES - a path is a list of line ('L') and cubic
 // bezier ('C') primitives. Beziers stay beziers all the way through; they are
@@ -52,6 +53,20 @@ const SMALL_PART_MM = 1e6
 // separate "may fall through" warning and the optional viewer highlight.
 const TINY_PART_W = 15   // mm - larger side
 const TINY_PART_H = 8    // mm, shorter side
+// A closed contour only counts as a part if it encloses at least this much.
+const MIN_PART_AREA = 0.01   // mm²
+
+// Signed area enclosed by a polyline (shoelace), mm². Always closes the loop
+// from the last point back to the first, so a nearly-closed contour still
+// measures right and a lone short line comes out as 0.
+function enclosedArea(pts) {
+  let a = 0
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i + 1) % pts.length]
+    a += p.x * q.y - q.x * p.y
+  }
+  return a / 2
+}
 
 export const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y)
 
@@ -96,26 +111,23 @@ export const cornerPenaltyFor = (m) => (m.category === 'raster' ? 0 : CORNER_PEN
 // Extra time (s) charged on a move beyond the traversal of its own geometry:
 //   travel - the fixed cost of starting the next vector;
 //   raster - the SPEED-INDEPENDENT part of the per-scan-line overhead plus the
-//            Y feed, once per scan row (m.rows). The speed-DEPENDENT part is
-//            carried by the geometry instead, as overscan (see below).
+//            Y feed, once per scan row (m.rows). Both come straight from the
+//            measured table (m.lineOverhead), no longer from a formula.
 export const moveExtraTime = (m) => {
   if (m.kind === 'travel') return m.home ? 0 : CALIBRATION.vectorStartPenalty   // home leg starts no vector
   if (m.category === 'raster' && m.rows) {
-    return m.rows * (CALIBRATION.rasterLineBase + CALIBRATION.rasterYFeed * m.pitch)
+    return m.rows * (m.lineOverhead + CALIBRATION.rasterYFeed * m.pitch)
   }
   return 0
 }
 
-// Overscan per side: the run-out the head needs to turn around at the end of a
-// scan row. This is the part of the per-line overhead that scales with the
-// raster speed - charging it as DISTANCE (rather than as time) keeps the drawn
-// geometry and the estimate consistent: 2*over/v is exactly rasterLineRamp*v.
-// The fixed part of the overhead stays a time and is added in moveExtraTime;
-// folding it into the distance too (as this did before 60–100 % were measured)
-// would draw >100 mm of overscan per side at 100 % raster speed.
-function rasterOverscanFor(speed) {
-  return (CALIBRATION.rasterLineRamp * speed * speed) / 2
-}
+// NO overscan is drawn any more. It used to be derived from the per-line
+// overhead on the assumption that the overhead IS a run-out, so charging it as
+// distance kept geometry and timing consistent. The measured overhead is
+// U-shaped over speed (see calibration.js), which no run-out can produce - so
+// the assumption was wrong, the overhead is now a tabulated TIME, and drawing a
+// made-up overhang would only add time the machine does not spend (scan rows
+// run at a = 0, so every drawn mm costs time).
 
 // Speed (mm/s) at distance s along a run of length S that starts and ends at
 // rest, with target speed v and acceleration a (trapezoid, or triangle when the
@@ -165,6 +177,31 @@ export function movePolyline(m) {
   return pts
 }
 
+// "Optimieren" OFF on the machine (path order 'file'): MEASURED, the head stops
+// at EVERY original vertex of a straight-segment path, not only at corners
+// sharper than cornerAngleDeg. Points that come from flattening a real bezier
+// are exempt - the machine drives curves through. Evidence, est (off) vs opt
+// (on) column of messprotokoll.xlsx: 51_poly_circles 94 s vs 74 s,
+// 50_bezier_circles 74 s vs 74 s, 14_circle_d80 169 s vs 145 s. Same rule as
+// moves_and_stops(every_vertex=True) in docs/calib/fit_model.py.
+//
+// This is why joining Archicad's exploded 0,2 mm pieces into one path changes
+// nothing with "Optimieren" off: every join is still a straight-line vertex.
+// Only turning them into curves (or switching "Optimieren" on) removes the stops.
+//
+// Returns one flag per point of movePolyline(m) (true = forced stop), or null
+// when the move has none.
+export function forcedStopsFor(m) {
+  if (!m.vertexStops || !m.prims) return null
+  const flags = []
+  m.prims.forEach((prim, k) => {
+    const n = prim.t === 'L' ? 2 : flattenPrim(prim).length
+    for (let i = flags.length === 0 ? 0 : 1; i < n; i++) flags.push(false)   // join point deduped, like movePolyline
+    if (k < m.prims.length - 1 && prim.t === 'L') flags[flags.length - 1] = true
+  })
+  return flags
+}
+
 /**
  * Acceleration-aware per-segment timing for a polyline. The head starts and ends
  * at rest AND comes to rest at every sharp corner, so each raster scan line
@@ -175,7 +212,7 @@ export function movePolyline(m) {
  * @returns {{ durs:number[], speeds:number[], total:number }}
  *   durs[i] / speeds[i] = duration (s) and average speed (mm/s) of segment i.
  */
-export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY) {
+export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, forced = null) {
   const n = points.length - 1
   if (n <= 0) return { durs: [], speeds: [], total: 0 }
   const segs = []
@@ -189,6 +226,7 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY) {
   const stop = new Array(n + 1).fill(false)
   stop[0] = true; stop[n] = true
   for (let i = 1; i < n; i++) {
+    if (forced && forced[i]) { stop[i] = true; continue }   // see forcedStopsFor
     const a0 = segs[i - 1], a1 = segs[i]
     if (a0.L < 1e-9 || a1.L < 1e-9) { stop[i] = true; continue }
     if (a0.ux * a1.ux + a0.uy * a1.uy < CORNER_COS) stop[i] = true
@@ -227,7 +265,7 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY) {
  *   dur         duration (s) of the segment under the acceleration profile
  *   runStartRel time (s) at the run's start, relative to the polyline start
  */
-export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY) {
+export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY, forced = null) {
   const n = points.length - 1
   const out = []
   if (n <= 0) return out
@@ -240,6 +278,7 @@ export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY) {
   const stop = new Array(points.length).fill(false)
   stop[0] = true; stop[n] = true
   for (let i = 1; i < n; i++) {
+    if (forced && forced[i]) { stop[i] = true; continue }   // see forcedStopsFor
     const ax = points[i].x - points[i - 1].x, ay = points[i].y - points[i - 1].y
     const bx = points[i + 1].x - points[i].x, by = points[i + 1].y - points[i].y
     const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by)
@@ -274,8 +313,10 @@ export function categorize(hex) {
   const r = parseInt(hex.slice(1, 3), 16) / 255
   const g = parseInt(hex.slice(3, 5), 16) / 255
   const b = parseInt(hex.slice(5, 7), 16) / 255
-  if (b > 0.8 && r < 0.2) return 'blue'
-  if (r > 0.8 && b < 0.2) return 'red'
+  // Green must stay low too: otherwise orange/yellow counted as red (vector
+  // engrave) and cyan as blue (cut) - see "werkzeug tests/edge cases".
+  if (b > 0.8 && r < 0.2 && g < 0.35) return 'blue'
+  if (r > 0.8 && b < 0.2 && g < 0.35) return 'red'
   if (g > 0.5 && r < 0.4) return 'green'
   // grayscale (black / white / any gray) is raster-engraved, like a bitmap.
   if (Math.max(r, g, b) - Math.min(r, g, b) < GRAY_TOL) return 'gray'
@@ -785,6 +826,308 @@ export function removeTinySegments(data, minLen = TINY_SEGMENT_LEN) {
   return data.filter((o) => !((o.type === 'l' || o.type === 'c') && strokeLen(o) < minLen))
 }
 
+// ── Wasserzeichen entfernen ───────────────────────────────────────────────────
+// The extraction only TAGS watermark objects (o.wm, see api_pdf_extraction.py and
+// backend/watermarks.xml) - they stay visible, because the laser would get them
+// too. Removing them is the user's call. Afterwards the drawing is moved so its
+// top-left corner sits WATERMARK_MARGIN mm from the bed corner again: a removed
+// stamp often was the outermost thing on the page.
+const WATERMARK_MARGIN = 5   // mm
+
+function objSegs(o) {
+  if (o.type === 'l' || o.type === 'c') return strokeSegs(o)
+  if (o.type === 'fp') return fpSegs(o.path)
+  if (o.type === 'img') {
+    const x0 = o.x, x1 = o.x + o.w, y0 = o.y, y1 = o.y - o.h
+    return [{ x1: x0, y1: y0, x2: x1, y2: y0 }, { x1, y1: y0, x2: x1, y2: y1 },
+            { x1, y1, x2: x0, y2: y1 }, { x1: x0, y1, x2: x0, y2: y0 }]
+  }
+  return []
+}
+
+export function detectWatermarks(data) {
+  let count = 0
+  const segs = []
+  for (const o of data) if (o.wm) { count++; segs.push(...objSegs(o)) }
+  return { count, segs }
+}
+
+// Exact extent of the drawing (curves flattened finely, not their control
+// points). Coordinates: x right, y negative downward, so top-left = (minX, maxY).
+function drawingBBox(data) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+  const grow = (x, y) => {
+    if (x < minX) minX = x; if (x > maxX) maxX = x
+    if (y < minY) minY = y; if (y > maxY) maxY = y
+  }
+  for (const o of data) {
+    if (o.type === 'l') { grow(o.x1, o.y1); grow(o.x2, o.y2) }
+    else if (o.type === 'c') { for (const p of flattenPrim(objToPrim(o), 0.005)) grow(p.x, p.y) }
+    else if (o.type === 'fp') { for (const s of fpSegs(o.path)) { grow(s.x1, s.y1); grow(s.x2, s.y2) } }
+    else if (o.type === 'img') { grow(o.x, o.y); grow(o.x + o.w, o.y - o.h) }
+  }
+  return isFinite(minX) ? { minX, maxX, minY, maxY } : null
+}
+
+// Moves everything so the drawing's top-left corner is `margin` mm in from the
+// bed's top-left corner. Returns the shifted data (or the input if nothing moves).
+export function alignTopLeft(data, margin = WATERMARK_MARGIN) {
+  const box = drawingBBox(data)
+  if (!box) return data
+  const dx = margin - box.minX, dy = -margin - box.maxY
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return data
+  return data.map((o) => (o.type === 'mbox' ? o : translateObj(o, dx, dy)))
+}
+
+export function removeWatermarks(data, margin = WATERMARK_MARGIN) {
+  const kept = data.filter((o) => !o.wm)
+  const count = data.length - kept.length
+  return { data: count > 0 ? alignTopLeft(kept, margin) : data, count }
+}
+
+// ── Kurven verbinden (join + smooth) ──────────────────────────────────────────
+// CAD exports (Archicad above all) often store every contour as thousands of
+// separate ~0,2 mm straight pieces. Two separate things happen here:
+//   1. JOIN: same-colour pieces whose endpoints touch become one path (one
+//      shared `pid`), and the PDF export writes each pid as ONE path object
+//      (api_save_pdf.py) instead of one object per piece.
+//   2. SMOOTH: runs of short, gently bending straight pieces are replaced by
+//      fitted bezier curves that stay within JOIN_FIT_TOL of the original points.
+// Only (2) changes how the machine drives with "Optimieren" off: it stops at
+// every straight-line vertex but drives curves through (forcedStopsFor). With
+// "Optimieren" on it already drives through gentle bends, joined or not - so
+// there the estimate barely moves, which is the honest answer.
+const JOIN_FIT_TOL = 0.02     // mm, max distance of the fitted curve from the original points
+const JOIN_SHORT_SEG = 2      // mm, longer straight pieces are real edges and stay lines
+const JOIN_SMOOTH_DEG = 20    // a bend sharper than this between two pieces is a real corner
+const JOIN_MIN_RUN = 3        // fewer pieces than this are not worth a curve
+const JOIN_SMOOTH_COS = Math.cos((JOIN_SMOOTH_DEG * Math.PI) / 180)
+
+let joinPidCounter = 0
+const nextJoinPid = () => `j${++joinPidCounter}`   // the extraction uses numeric pids, no collision
+
+// Index ranges [start, end) of prims that should become one fitted curve run.
+function smoothRuns(prims) {
+  const runs = []
+  const short = (p) => {
+    if (p.t !== 'L') return false
+    const L = dist(p.a, p.b)
+    return L > 1e-9 && L < JOIN_SHORT_SEG
+  }
+  const gentle = (p, q) => {
+    const ax = p.b.x - p.a.x, ay = p.b.y - p.a.y, bx = q.b.x - q.a.x, by = q.b.y - q.a.y
+    return (ax * bx + ay * by) / (Math.hypot(ax, ay) * Math.hypot(bx, by)) >= JOIN_SMOOTH_COS
+  }
+  let rs = -1
+  const close = (end) => { if (rs >= 0 && end - rs >= JOIN_MIN_RUN) runs.push([rs, end]) }
+  for (let i = 0; i < prims.length; i++) {
+    if (!short(prims[i])) { close(i); rs = -1; continue }
+    if (rs >= 0 && !gentle(prims[i - 1], prims[i])) { close(i); rs = i; continue }
+    if (rs < 0) rs = i
+  }
+  close(prims.length)
+  return runs
+}
+
+// Which chains would change: more than one source object (or no pid info) to
+// join, or something to smooth. Already-joined, already-smooth paths are skipped,
+// so a second run reports nothing.
+function joinPlan(data) {
+  const items = []
+  data.forEach((obj, idx) => {
+    const prim = objToPrim(obj)
+    if (prim) items.push({ key: (obj.color || '#000000').toLowerCase(), prim, ref: idx })
+  })
+  const plans = []
+  for (const chain of chainPrims(items)) {
+    if (chain.prims.length < 2) continue
+    const pids = new Set(chain.refs.map((i) => data[i].pid))
+    const runs = smoothRuns(chain.prims)
+    const separate = pids.size > 1 || pids.has(undefined)
+    if (!separate && runs.length === 0) continue
+    plans.push({ chain, runs })
+  }
+  return plans
+}
+
+export function detectJoinCurves(data) {
+  let count = 0
+  const segs = []
+  for (const { chain } of joinPlan(data)) {
+    for (const i of chain.refs) { count++; segs.push(...strokeSegs(data[i])) }
+  }
+  return { count, segs }
+}
+
+const r4 = (v) => Math.round(v * 1e4) / 1e4
+function primObj(prim, color, pid) {
+  if (prim.t === 'L') {
+    return { type: 'l', x1: prim.a.x, y1: prim.a.y, x2: prim.b.x, y2: prim.b.y, color, pid }
+  }
+  return { type: 'c', x1: prim.p0.x, y1: prim.p0.y, x2: r4(prim.p1.x), y2: r4(prim.p1.y),
+           x3: r4(prim.p2.x), y3: r4(prim.p2.y), x4: prim.p3.x, y4: prim.p3.y, color, pid }
+}
+
+// Returns { data, count, paths }: the new object list (each joined chain sits at
+// the position of its first source object, so drawing order is kept), how many
+// source objects were merged, and into how many paths.
+export function joinCurves(data) {
+  const plans = joinPlan(data)
+  if (!plans.length) return { data, count: 0, paths: 0 }
+  const replace = new Map()
+  const consumed = new Set()
+  let count = 0
+  for (const { chain, runs } of plans) {
+    const color = data[chain.seedRef].color
+    const pid = nextJoinPid()
+    const objs = []
+    let k = 0
+    for (const [rs, re] of runs) {
+      for (; k < rs; k++) objs.push(primObj(chain.prims[k], color, pid))
+      const pts = [chain.prims[rs].a]
+      for (let j = rs; j < re; j++) pts.push(chain.prims[j].b)
+      for (const b of fitCubics(pts, JOIN_FIT_TOL)) {
+        objs.push(primObj({ t: 'C', p0: b[0], p1: b[1], p2: b[2], p3: b[3] }, color, pid))
+      }
+      k = re
+    }
+    for (; k < chain.prims.length; k++) objs.push(primObj(chain.prims[k], color, pid))
+    // Pieces only had to MEET within LINK_TOL to be chained. Make every start
+    // land exactly on the previous end, otherwise the export starts a new
+    // subpath (a fresh moveto) at each tiny gap.
+    for (let i = 1; i < objs.length; i++) {
+      const prev = objs[i - 1]
+      objs[i].x1 = prev.type === 'l' ? prev.x2 : prev.x4
+      objs[i].y1 = prev.type === 'l' ? prev.y2 : prev.y4
+    }
+    let first = Infinity
+    for (const i of chain.refs) { consumed.add(i); if (i < first) first = i }
+    replace.set(first, objs)
+    count += chain.refs.length
+  }
+  const out = []
+  data.forEach((o, i) => {
+    if (replace.has(i)) out.push(...replace.get(i))
+    else if (!consumed.has(i)) out.push(o)
+  })
+  return { data: out, count, paths: plans.length }
+}
+
+// ── Bezier fitting (Schneider, "An Algorithm for Automatically Fitting
+// Digitized Curves", Graphics Gems 1990) ──────────────────────────────────────
+// Fits a chain of cubic beziers through `pts` so that every input point lies
+// within `tol` of the curve. Returns [[p0, p1, p2, p3], ...].
+const vSub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y })
+const vAdd = (a, b) => ({ x: a.x + b.x, y: a.y + b.y })
+const vScale = (a, s) => ({ x: a.x * s, y: a.y * s })
+const vDot = (a, b) => a.x * b.x + a.y * b.y
+const vUnit = (a) => { const L = Math.hypot(a.x, a.y); return L > 1e-12 ? { x: a.x / L, y: a.y / L } : { x: 0, y: 0 } }
+
+function bezPoint(b, t) {
+  const mt = 1 - t
+  const k0 = mt * mt * mt, k1 = 3 * t * mt * mt, k2 = 3 * t * t * mt, k3 = t * t * t
+  return { x: k0 * b[0].x + k1 * b[1].x + k2 * b[2].x + k3 * b[3].x,
+           y: k0 * b[0].y + k1 * b[1].y + k2 * b[2].y + k3 * b[3].y }
+}
+
+export function fitCubics(pts, tol) {
+  const n = pts.length
+  if (n < 2) return []
+  const out = []
+  const t1 = vUnit(vSub(pts[1], pts[0]))
+  const t2 = vUnit(vSub(pts[n - 2], pts[n - 1]))
+  fitRange(pts, 0, n - 1, t1, t2, tol * tol, out, 0)
+  return out
+}
+
+function fitRange(pts, first, last, tHat1, tHat2, errSq, out, depth) {
+  const p0 = pts[first], p3 = pts[last]
+  if (last - first === 1 || depth > 64) {
+    if (last - first === 1) {
+      const d = dist(p0, p3) / 3
+      out.push([p0, vAdd(p0, vScale(tHat1, d)), vAdd(p3, vScale(tHat2, d)), p3])
+    } else {
+      // Pathological input - keep the original points as straight curve pieces.
+      for (let i = first; i < last; i++) {
+        const a = pts[i], b = pts[i + 1], d = vScale(vSub(b, a), 1 / 3)
+        out.push([a, vAdd(a, d), vSub(b, d), b])
+      }
+    }
+    return
+  }
+  let u = chordParams(pts, first, last)
+  let bez = generateBezier(pts, first, last, u, tHat1, tHat2)
+  let { max, split } = maxFitError(pts, first, last, bez, u)
+  if (max < errSq) { out.push(bez); return }
+  if (max < errSq * 4) {
+    for (let it = 0; it < 4; it++) {
+      u = u.map((t, k) => newtonRoot(bez, pts[first + k], t))
+      bez = generateBezier(pts, first, last, u, tHat1, tHat2)
+      ;({ max, split } = maxFitError(pts, first, last, bez, u))
+      if (max < errSq) { out.push(bez); return }
+    }
+  }
+  let tc = vUnit(vSub(pts[split - 1], pts[split + 1]))
+  if (tc.x === 0 && tc.y === 0) tc = vUnit(vSub(pts[split - 1], pts[split]))
+  fitRange(pts, first, split, tHat1, tc, errSq, out, depth + 1)
+  fitRange(pts, split, last, vScale(tc, -1), tHat2, errSq, out, depth + 1)
+}
+
+function chordParams(pts, first, last) {
+  const u = [0]
+  for (let i = first + 1; i <= last; i++) u.push(u[u.length - 1] + dist(pts[i], pts[i - 1]))
+  const total = u[u.length - 1] || 1
+  return u.map((v) => v / total)
+}
+
+// Least-squares control points along the fixed end tangents.
+function generateBezier(pts, first, last, u, tHat1, tHat2) {
+  const p0 = pts[first], p3 = pts[last]
+  let c00 = 0, c01 = 0, c11 = 0, x0 = 0, x1 = 0
+  for (let i = 0; i < u.length; i++) {
+    const t = u[i], mt = 1 - t
+    const b0 = mt * mt * mt, b1 = 3 * t * mt * mt, b2 = 3 * t * t * mt, b3 = t * t * t
+    const a1 = vScale(tHat1, b1), a2 = vScale(tHat2, b2)
+    c00 += vDot(a1, a1); c01 += vDot(a1, a2); c11 += vDot(a2, a2)
+    const tmp = vSub(pts[first + i], vAdd(vScale(p0, b0 + b1), vScale(p3, b2 + b3)))
+    x0 += vDot(a1, tmp); x1 += vDot(a2, tmp)
+  }
+  const det = c00 * c11 - c01 * c01
+  let al = Math.abs(det) > 1e-18 ? (x0 * c11 - x1 * c01) / det : 0
+  let ar = Math.abs(det) > 1e-18 ? (c00 * x1 - c01 * x0) / det : 0
+  const segLen = dist(p0, p3)
+  if (al < 1e-6 * segLen || ar < 1e-6 * segLen) al = ar = segLen / 3   // Wu/Barsky fallback
+  return [p0, vAdd(p0, vScale(tHat1, al)), vAdd(p3, vScale(tHat2, ar)), p3]
+}
+
+function maxFitError(pts, first, last, bez, u) {
+  let max = 0, split = Math.floor((first + last) / 2)
+  for (let i = first + 1; i < last; i++) {
+    const p = bezPoint(bez, u[i - first])
+    const d = (p.x - pts[i].x) ** 2 + (p.y - pts[i].y) ** 2
+    if (d >= max) { max = d; split = i }
+  }
+  return { max, split }
+}
+
+// One Newton-Raphson step towards the parameter of the curve point closest to P.
+function newtonRoot(b, P, t) {
+  const mt = 1 - t
+  const q = bezPoint(b, t)
+  const q1 = {
+    x: 3 * (mt * mt * (b[1].x - b[0].x) + 2 * t * mt * (b[2].x - b[1].x) + t * t * (b[3].x - b[2].x)),
+    y: 3 * (mt * mt * (b[1].y - b[0].y) + 2 * t * mt * (b[2].y - b[1].y) + t * t * (b[3].y - b[2].y)),
+  }
+  const q2 = {
+    x: 6 * (mt * (b[2].x - 2 * b[1].x + b[0].x) + t * (b[3].x - 2 * b[2].x + b[1].x)),
+    y: 6 * (mt * (b[2].y - 2 * b[1].y + b[0].y) + t * (b[3].y - 2 * b[2].y + b[1].y)),
+  }
+  const dx = q.x - P.x, dy = q.y - P.y
+  const den = q1.x * q1.x + q1.y * q1.y + dx * q2.x + dy * q2.y
+  if (Math.abs(den) < 1e-12) return t
+  return Math.min(1, Math.max(0, t - (dx * q1.x + dy * q1.y) / den))
+}
+
 // ── Rotate the whole design 90° ───────────────────────────────────────────────
 // dir: 'ccw' (rotate left) | 'cw' (rotate right). After rotating, the content is
 // re-anchored so its top-left corner sits back at (0,0) (x ≥ 0, y ≤ 0).
@@ -942,26 +1285,40 @@ function primLength(p) {
 // edit or extraction order.
 const LINK_TOL = 0.01   // mm - matches the old adjacency tolerance
 
-function reconstructPaths(data) {
-  const prims = []
-  for (const obj of data) {
-    let prim, color
-    if (obj.type === 'l') {
-      color = obj.color || '#000000'
-      prim = { t: 'L', a: { x: obj.x1, y: obj.y1 }, b: { x: obj.x2, y: obj.y2 } }
-    } else if (obj.type === 'c') {
-      color = obj.color || '#000000'
-      prim = {
-        t: 'C',
-        p0: { x: obj.x1, y: obj.y1 }, p1: { x: obj.x2, y: obj.y2 },
-        p2: { x: obj.x3, y: obj.y3 }, p3: { x: obj.x4, y: obj.y4 },
-      }
-    } else {
-      continue // fp / img / mbox are not vector toolpaths
+// l / c extraction object -> primitive ('L' / 'C'), or null for anything else.
+function objToPrim(obj) {
+  if (obj.type === 'l') return { t: 'L', a: { x: obj.x1, y: obj.y1 }, b: { x: obj.x2, y: obj.y2 } }
+  if (obj.type === 'c') {
+    return {
+      t: 'C',
+      p0: { x: obj.x1, y: obj.y1 }, p1: { x: obj.x2, y: obj.y2 },
+      p2: { x: obj.x3, y: obj.y3 }, p3: { x: obj.x4, y: obj.y4 },
     }
-    const cat = categorize(color)
-    prims.push({ cat, color, prim, start: primStart(prim), end: primEnd(prim) })
   }
+  return null
+}
+
+function reconstructPaths(data) {
+  const items = []
+  for (const obj of data) {
+    const prim = objToPrim(obj)
+    if (!prim) continue   // fp / img / mbox are not vector toolpaths
+    const color = obj.color || '#000000'
+    items.push({ key: categorize(color), prim, ref: color })
+  }
+  return chainPrims(items).map((c) => ({
+    category: c.key, color: c.seedRef, prims: c.prims, start: c.start, end: c.end,
+  }))
+}
+
+// Links primitives into chains by matching ENDPOINTS within LINK_TOL, only
+// between items with the same `key`. items: [{ key, prim, ref }]. Returns
+// [{ key, prims, refs, seedRef, start, end }]: prims oriented head to tail,
+// refs = the items' refs in the same order, seedRef = the ref the chain grew from.
+function chainPrims(items) {
+  const prims = items.map((it) => ({
+    cat: it.key, ref: it.ref, prim: it.prim, start: primStart(it.prim), end: primEnd(it.prim),
+  }))
 
   const n = prims.length
   const used = new Array(n).fill(false)
@@ -1002,7 +1359,8 @@ function reconstructPaths(data) {
     used[i] = true
     const seed = prims[i]
     const chain = [seed.prim]
-    const cat = seed.cat, color = seed.color
+    const refs = [seed.ref]
+    const cat = seed.cat
     let head = seed.start, tail = seed.end
 
     // Extend forward from the tail (next primitive's start must meet our tail).
@@ -1013,6 +1371,7 @@ function reconstructPaths(data) {
       let next = prims[m.idx].prim
       if (m.which === 'end') next = reversePrim(next)   // orient so its start == tail
       chain.push(next)
+      refs.push(prims[m.idx].ref)
       tail = primEnd(next)
       if (closes(tail, head)) break                     // loop closed
     }
@@ -1025,11 +1384,12 @@ function reconstructPaths(data) {
         let prev = prims[m.idx].prim
         if (m.which === 'start') prev = reversePrim(prev)   // orient so its end == head
         chain.unshift(prev)
+        refs.unshift(prims[m.idx].ref)
         head = primStart(prev)
         if (closes(tail, head)) break
       }
     }
-    paths.push({ category: cat, color, prims: chain, start: head, end: tail })
+    paths.push({ key: cat, prims: chain, refs, seedRef: seed.ref, start: head, end: tail })
   }
   return paths
 }
@@ -1099,7 +1459,27 @@ function fpLoops(path) {
  * @returns {Array<{ i:number, y:number, x0:number, x1:number }>} non-empty rows,
  *   top → bottom, `i` = row index (gaps in `i` mark empty bands).
  */
-function rasterScanRows(loops, pitch) {
+// Footprint row at fraction v (0 = top, 1 = bottom) of an image with analysed
+// ink (imageInk.js) -> [u0, u1] as fractions of the footprint width, or null.
+// A 90°/270° rotated image (rotateData) turns image COLUMNS into footprint rows.
+function imageSpanAt(img, v) {
+  const { ink } = img
+  const rot = (((img.rot || 0) % 360) + 360) % 360
+  if (rot === 0 || rot === 180) {
+    const r = Math.min(ink.h - 1, Math.floor((rot === 0 ? v : 1 - v) * ink.h))
+    const a = ink.rowX0[r]
+    if (a < 0) return null
+    const b = ink.rowX1[r] + 1
+    return rot === 0 ? [a / ink.w, b / ink.w] : [1 - b / ink.w, 1 - a / ink.w]
+  }
+  const c = Math.min(ink.w - 1, Math.floor((rot === 90 ? 1 - v : v) * ink.w))
+  const a = ink.colY0[c]
+  if (a < 0) return null
+  const b = ink.colY1[c] + 1
+  return rot === 90 ? [a / ink.h, b / ink.h] : [1 - b / ink.h, 1 - a / ink.h]
+}
+
+function rasterScanRows(loops, pitch, images = []) {
   const edges = []
   let maxY = -Infinity, minY = Infinity
   for (const { pts, color } of loops) {
@@ -1111,7 +1491,11 @@ function rasterScanRows(loops, pitch) {
                    xa: a.x, ya: a.y, dxdy: (b.x - a.x) / (b.y - a.y), color })
     }
   }
-  if (!edges.length || !isFinite(maxY)) return []
+  for (const img of images) {
+    if (img.y > maxY) maxY = img.y
+    if (img.y - img.h < minY) minY = img.y - img.h
+  }
+  if ((!edges.length && !images.length) || !isFinite(maxY)) return []
   edges.sort((e, f) => f.hi - e.hi)                   // sweep top → bottom
 
   const height = Math.max(0, maxY - minY)
@@ -1133,6 +1517,15 @@ function rasterScanRows(loops, pitch) {
       if (x > hi) hi = x
       if (e.color === 'green') green = true
     }
+    for (const img of images) {
+      const v = (img.y - y) / img.h
+      if (v < 0 || v >= 1) continue
+      const span = imageSpanAt(img, v)
+      if (!span) continue
+      const x0 = img.x + span[0] * img.w, x1 = img.x + span[1] * img.w
+      if (x0 < lo) lo = x0
+      if (x1 > hi) hi = x1
+    }
     if (lo <= hi) rows.push({ i, y, x0: lo, x1: hi, green })
   }
   return rows
@@ -1143,14 +1536,14 @@ function rasterScanRows(loops, pitch) {
  * content (plus the calibrated overscan). Emitted as one continuous engrave move
  * preceded by a travel to its start.
  */
-function rasterRegion(rows, lastPos, pitch, rasterSpeed = 0) {
+function rasterRegion(rows, lastPos, pitch, lineOverhead = 0) {
   // Colour is decided PER BAND (this contiguous run of rows), not for the whole
   // file: a photo bitmap and an unrelated green icon elsewhere in the design
   // both end up in the raster pass, but only rows a green loop actually crosses
   // should render green - otherwise a single green shape anywhere in the file
   // tinted every bitmap green too.
   const color = rows.some(r => r.green) ? RASTER_GREEN : RASTER_GRAY
-  const over = rasterOverscanFor(rasterSpeed)
+  const over = 0
   const topY = rows[0].y
   const botY = rows[rows.length - 1].y
   let bMinX = Infinity, bMaxX = -Infinity
@@ -1180,7 +1573,7 @@ function rasterRegion(rows, lastPos, pitch, rasterSpeed = 0) {
   moves.push({
     kind: 'engrave', color, category: 'raster', prims,
     // rows/pitch drive the per-scan-line overhead in moveExtraTime().
-    rows: rows.length, pitch: pitch || RASTER_PITCH,
+    rows: rows.length, pitch: pitch || RASTER_PITCH, lineOverhead,
     bbox: { minX: bMinX, maxX: bMaxX, minY: botY, maxY: topY },
   })
   const end = prims.length ? primEnd(prims[prims.length - 1]) : start
@@ -1289,13 +1682,15 @@ function optimizeOrder(paths, startPos, algo = DEFAULT_PATH_ORDER) {
  * @param {string} [opts.optimize='file']  path-order algorithm within each vector
  *   phase - one of PATH_ORDER_ALGORITHMS ('file' | 'nn' | '2opt'); a falsy value
  *   is treated as 'file' for backwards compatibility with the old boolean flag.
+ * @param {Function} [opts.imageInk]  (imgObj) => analysed ink or null, see
+ *   imageInk.js getImageInk; without it every image counts as its full rectangle.
  * @returns {{ moves: Array, stats: Object }}
  *   moves: ordered list of either
  *     { kind:'cut'|'engrave'|'other', color, category, prims }   (beam-on path)
  *     { kind:'travel', color, a, b }                             (rapid move)
  *   stats: { cutLen, engraveLen, otherLen, travelLen, totalTime } (mm / seconds)
  */
-export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, rasterPitch = RASTER_PITCH, accel = 0 } = {}) {
+export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, rasterPitch = RASTER_PITCH, accel = 0, imageInk = null } = {}) {
   // Accept the old boolean flag too: true -> default algorithm, false -> 'file'.
   const pathOrderAlgo = optimize === true ? DEFAULT_PATH_ORDER : (optimize || 'file')
   // Resolve the head speed (mm/s) for a move, with raster getting its own speed.
@@ -1303,6 +1698,13 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     const s = m.category === 'raster' ? (speeds.raster ?? speeds.engrave) : speeds[m.kind]
     return s || speeds.other || SPEED_MM_S.other
   }
+  // The per-line overhead is tabulated against the SPEED SETTING, not against
+  // mm/s, so recover the percentage from the resolved raster speed via the same
+  // table. (Raster and vector run on different speed scales - dividing by the
+  // vector maxSpeed here would be badly wrong.)
+  const rasterLineOverhead = rasterLineOverheadForPct(
+    rasterPctForSpeed(speeds.raster ?? speeds.engrave ?? SPEED_MM_S.raster))
+
   const allPaths = reconstructPaths(data)
   const rasterPaths = allPaths.filter(p => p.category === 'green' || p.category === 'gray')
   const vectorPaths = allPaths.filter(p => p.category !== 'green' && p.category !== 'gray')
@@ -1315,6 +1717,8 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   // Each loop keeps its OWN colour tag so a shared band can still tell which
   // rows are actually green vs. grayscale (see rasterScanRows/rasterRegion).
   const rasterLoops = []
+  const rasterImages = []   // images with analysed ink (opts.imageInk -> imageInk.js)
+  let colorImages = 0
   for (const p of rasterPaths) {
     const pts = []
     for (const prim of p.prims) {
@@ -1327,7 +1731,17 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     if (obj.type === 'fp' && isRasterColor(obj.fill)) {
       const color = isGreen(obj.fill) ? 'green' : 'gray'
       for (const loop of fpLoops(obj.path)) if (loop.length > 1) rasterLoops.push({ pts: loop, color })
-    } else if (obj.type === 'img' && obj.colorspace === 1) {
+    } else if (obj.type === 'img') {
+      // EVERY image is engraved as a raster - colour ones too, the driver turns
+      // them into grayscale. With its pixels analysed (imageInk.js) only the
+      // rows/spans that actually carry ink count; until then (or if decoding
+      // failed) the whole rectangle does, the conservative side.
+      const ink = imageInk ? imageInk(obj) : null
+      if (ink) {
+        if (!ink.empty) rasterImages.push({ ...obj, ink })
+        if (ink.colored) colorImages++
+        continue
+      }
       const b = bboxOfImage(obj)
       rasterLoops.push({
         pts: [{ x: b.minX, y: b.maxY }, { x: b.maxX, y: b.maxY },
@@ -1336,7 +1750,7 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
       })
     }
   }
-  const scanRows = rasterScanRows(rasterLoops, rasterPitch || RASTER_PITCH)
+  const scanRows = rasterScanRows(rasterLoops, rasterPitch || RASTER_PITCH, rasterImages)
   // Split into bands of CONTIGUOUS rows: an empty vertical gap ends a band.
   const bands = []
   for (const r of scanRows) {
@@ -1360,8 +1774,7 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   // neither lands at -0,7 %. And 52/53 (same two blocks, 5 mm vs 60 mm apart)
   // are both 379 s - crossing the gap costs nothing.
   for (const band of bands) {
-    const r = rasterRegion(band, lastPos, rasterPitch || RASTER_PITCH,
-                           speeds.raster ?? speeds.engrave)
+    const r = rasterRegion(band, lastPos, rasterPitch || RASTER_PITCH, rasterLineOverhead)
     for (const m of r.moves) if (m.kind !== 'travel') moves.push(m)
     lastPos = r.end
   }
@@ -1379,7 +1792,10 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
       if (dist(lastPos, p.start) > 0.1) {
         moves.push({ kind: 'travel', color: '#888888', a: { ...lastPos }, b: { ...p.start } })
       }
-      moves.push({ kind: kindOf(cat), color: p.color, category: cat, prims: p.prims })
+      // 'file' = the machine's "Optimieren" OFF: file order AND a stop at every
+      // straight-line vertex (forcedStopsFor). On: stops only at sharp corners.
+      moves.push({ kind: kindOf(cat), color: p.color, category: cat, prims: p.prims,
+                   vertexStops: pathOrderAlgo === 'file' })
       lastPos = p.end
       didVector = true
     }
@@ -1411,6 +1827,7 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     cutLen: 0, cutTime: 0, engraveLen: 0, engraveTime: 0, rasterLen: 0, rasterTime: 0,
     otherLen: 0, otherTime: 0, travelLen: 0, travelTime: 0, totalTime: 0,
     smallParts: 0, tinyParts: 0,
+    colorImages,   // colour images: engraved in grayscale, never cut - the UI notes it
   }
 
   // Cut-out parts (closed blue contours). Easy to forget when judging a job: each
@@ -1421,6 +1838,11 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   for (const p of vectorPaths) {
     if (p.category !== 'blue') continue
     if (Math.hypot(p.start.x - p.end.x, p.start.y - p.end.y) > 0.5) continue   // open → not a part
+    // Closed is not enough: a stray 0,1 mm line, or a line drawn there and back
+    // in one path, also ends where it starts but encloses nothing. Without this
+    // they showed up as "tiny parts that fall through the grid" (edge_winzig,
+    // edge_dopplungen in "werkzeug tests/edge cases").
+    if (Math.abs(enclosedArea(movePolyline(p))) < MIN_PART_AREA) continue
     const box = bboxOfPaths([p])
     if (!box) continue
     const w = box.maxX - box.minX, h = box.maxY - box.minY
@@ -1437,7 +1859,7 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     // Acceleration-aware: ramps at every corner (each scan-line turnaround), so
     // the printer's accel value actually drives the estimate.
     const T = rampSegments(movePolyline(m), speedFor(m), accelFor(m, accel),
-                           cornerPenaltyFor(m)).total + moveExtraTime(m)
+                           cornerPenaltyFor(m), forcedStopsFor(m)).total + moveExtraTime(m)
 
     if      (m.kind === 'travel')     { stats.travelLen  += L; stats.travelTime  += T }
     else if (m.kind === 'cut')        { stats.cutLen     += L; stats.cutTime     += T }
@@ -1447,5 +1869,25 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     stats.totalTime += T
   }
   stats.totalTime += CALIBRATION.jobOverhead
+
+  // ── Anzeige → Realität ──────────────────────────────────────────────────
+  // Everything above reproduces what the Job Manager DISPLAYS. The machine's
+  // actual run time differs from it systematically (25 stopwatch runs, see
+  // calibration.js REALITY): raster finishes early, vector with a lot of travel
+  // runs late. stats.displayTime keeps the machine's own number, stats.totalTime
+  // becomes the one that matters - how long the job really takes.
+  stats.displayTime = stats.totalTime
+  let rasterRows = 0, rasterHeight = 0, contours = 0
+  for (const m of moves) {
+    if (m.category === 'raster' && m.rows) { rasterRows += m.rows; rasterHeight += m.rows * m.pitch }
+    else if (m.kind !== 'travel') contours++
+  }
+  stats.realDelta =
+      REALITY.rasterPerLine * rasterRows
+    + REALITY.rasterPerMmHeight * rasterHeight
+    + REALITY.vectorPerContour * contours
+    + REALITY.vectorPerMmTravel * stats.travelLen
+  stats.totalTime = Math.max(0, stats.displayTime + stats.realDelta)
+
   return { moves, stats, tinyBoxes }
 }

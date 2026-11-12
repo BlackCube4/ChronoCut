@@ -25,7 +25,7 @@
       <!-- Warning badge. Clicking it opens the breakdown, where the actual
            notes live (a tooltip alone is easy to miss and can't be acted on). -->
       <button
-        v-if="showWarning || showTinyWarning"
+        v-if="showWarning || showTinyWarning || showColorNote"
         class="warn-badge"
         :title="warnTitle"
         @click="expanded = true"
@@ -131,6 +131,7 @@
           </div>
 
           <p v-if="showWarning" class="warn-note">{{ warningText }}</p>
+          <p v-if="showColorNote" class="warn-note">{{ colorText }}</p>
           <button
             v-if="showTinyWarning"
             class="warn-note tiny"
@@ -243,9 +244,16 @@ const toggleTinyHighlight = () => {
   eventBus.emit('tiny-highlight-changed', tinyHighlight.value)
 }
 
-// Combined tooltip for the warning badge (both warnings, if active).
+// Colour images: the driver engraves them in grayscale, it never cuts them. A
+// common surprise (a drawing pasted in as a screenshot), so it's pointed out.
+const colorImages = computed(() => stats.value?.colorImages || 0)
+const showColorNote = computed(() => colorImages.value > 0)
+const colorText = computed(() => t('colorImagesNote', { n: colorImages.value }))
+
+// Combined tooltip for the warning badge (every active note).
 const warnTitle = computed(() =>
-  [showWarning.value ? warningText.value : null, showTinyWarning.value ? tinyText.value : null]
+  [showWarning.value ? warningText.value : null, showTinyWarning.value ? tinyText.value : null,
+   showColorNote.value ? colorText.value : null]
     .filter(Boolean).join('\n'))
 
 // One row per operation type that has any length. Colours mirror the viewer.

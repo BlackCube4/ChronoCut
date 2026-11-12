@@ -1,14 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Watermark text to strip on upload (e.g. ArchiCAD educational-version stamps).
-  Add one <text> per phrase. Matching is case-insensitive and matches a substring
-  of a text line on the page; any vector/text inside a matching region is removed
-  during extraction. Leave empty to disable.
+  Watermark phrases. Matching is case-insensitive (spaces optional) and looks
+  for the phrase anywhere in a text line; the WHOLE line then counts as
+  watermark. Every vector/text object inside it is TAGGED on upload (not
+  removed): the user sees the watermark, and the "Wasserzeichen entfernen"
+  button in the sidebar removes it on request. Add one <text> per phrase.
 
-  Add the exact phrases your exports contain, for example:
-    <text>EDUCATIONAL VERSION</text>
-    <text>CREATED WITH AN EDUCATIONAL VERSION OF GRAPHISOFT ARCHICAD</text>
+  Only works when the watermark is real text in the PDF. Watermarks drawn as
+  plain lines (e.g. some CAD plot stamps) cannot be found this way.
+
+  GSEducationalVersion is the invisible white marker Archicad's educational
+  version puts on every exported page. When it is present, the visible
+  "ARCHICAD BILDUNGSVERSION" stamp image is offered for removal too (that one
+  is a picture, not text - see _is_edu_stamp in api/api_pdf_extraction.py).
 -->
 <watermarks>
+  <!-- Archicad / Graphisoft -->
+  <text>GSEducationalVersion</text>
+  <text>BILDUNGSVERSION</text>
+  <!-- Educational / student licences (Autodesk, Vectorworks, Allplan, ...) -->
   <text>EDUCATIONAL VERSION</text>
+  <text>EDUCATIONAL PRODUCT</text>
+  <text>STUDENT VERSION</text>
+  <text>STUDENTENVERSION</text>
+  <text>STUDENT EDITION</text>
+  <text>NOT FOR COMMERCIAL USE</text>
+  <text>NICHT FÜR KOMMERZIELLE</text>
+  <!-- Trial / demo builds -->
+  <text>TRIAL VERSION</text>
+  <text>EVALUATION VERSION</text>
+  <text>DEMO VERSION</text>
+  <text>TESTVERSION</text>
 </watermarks>

@@ -12,6 +12,7 @@ export const VIEW_SETTINGS_KEY = 'chronocut-view-settings'
 export const DEFAULT_VIEW_SETTINGS = {
   showTravel: true,
   showRulers: true,
+  imagesGray: false,         // show images in grayscale, the way the laser engraves them
   rasterMode: 'lines',       // 'lines' | 'block' | 'outline'
   debugColors: false,
   speedGradient: false,
@@ -19,6 +20,10 @@ export const DEFAULT_VIEW_SETTINGS = {
   pathOrder: DEFAULT_PATH_ORDER,
   // What the "reset view" button frames: 'all' | 'lasered' | 'visible'.
   focusMode: 'all',
+  // Which of the two times the UI shows. The model knows both: what the Job
+  // Manager DISPLAYS, and how long the machine actually takes (calibration.js
+  // REALITY). Default is the real one - that is what the job costs in practice.
+  showMachineEstimate: false,
 }
 
 // Curve-fidelity presets (mm bezier-flatness tolerance) - the single source

@@ -119,7 +119,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
+import { ensureImageInk, getImageInk } from '../imageInk'
 import { loadProfiles, speedsFor, hasThicknessChoice, familyDetail } from '../profiles'
 import { buildToolpath, fixColors, removeWhite, computeDoubleRemoval, PATH_ORDER_ALGORITHMS } from '../toolpath'
 import { getStoredViewSettings, setStoredViewSetting } from '../viewSettings'
@@ -180,10 +181,17 @@ const speedOpts = computed(() =>
     ? speedsFor(selectedCutter.value, selectedThickness.value)
     : null)
 
+// Images count with their real ink once analysed (imageInk.js); bumping this
+// re-runs the estimate when that lands.
+const inkVersion = ref(0)
+watch(data, (d) => { ensureImageInk(d).then((changed) => { if (changed) inkVersion.value++ }) })
+
 const stats = computed(() => {
   if (!hasData.value || !speedOpts.value) return null
+  inkVersion.value   // dependency, see above
   try {
-    return buildToolpath(data.value, { optimize: selectedPathOrderId.value, ...speedOpts.value }).stats
+    return buildToolpath(data.value, { optimize: selectedPathOrderId.value, ...speedOpts.value,
+                                       imageInk: getImageInk }).stats
   } catch (e) {
     console.error('toolpath error:', e)
     return null

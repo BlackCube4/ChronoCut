@@ -131,6 +131,20 @@
             <span class="vt-radio"></span>
             <span>{{ t(d.label) }}</span>
           </button>
+
+          <!-- Which time the UI shows. Separate from the two colour modes above
+               (those are mutually exclusive with each other, this one is not),
+               hence its own handler rather than toggleKey. -->
+          <span class="vt-sep"></span>
+          <button
+            class="vt-item"
+            :class="{ active: state.showMachineEstimate }"
+            :title="t('tipMachineEstimate')"
+            @click="toggleMachineEstimate"
+          >
+            <span class="vt-radio"></span>
+            <span>{{ t('machineEstimate') }}</span>
+          </button>
         </div>
       </Transition>
     </div>
@@ -169,10 +183,13 @@ const ICON_RASTER = icon('<rect x="4" y="4" width="16" height="16" rx="2"/><path
 const ICON_DEBUG  = icon('<rect x="8" y="9" width="8" height="10" rx="4"/><path d="M12 9 V19"/><path d="M9 5 l1.5 3 M15 5 l-1.5 3"/><path d="M8 12 H5 M8 16 H6 M16 12 H19 M16 16 H18"/>')
 const ICON_TESS   = icon('<path d="M3 17 Q9 17 9 12 T15 7 T21 7"/>')
 const ICON_RESET  = icon('<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M12 8 v8 M8 12 h8" stroke-width="1.6"/>')
+// Picture frame with a mountain, half of it filled: "image, in grayscale".
+const ICON_IMAGE  = icon('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 16 l5 -5 l4 4 l3 -3 l6 6" stroke-width="1.5"/><circle cx="16" cy="9.5" r="1.5"/>')
 
 const simpleToggles = [
   { key: 'showTravel', label: 'showTravel', event: 'show-travel-changed', icon: ICON_TRAVEL },
   { key: 'showRulers', label: 'showRulers', event: 'rulers-changed',      icon: ICON_RULER },
+  { key: 'imagesGray', label: 'imagesGray', event: 'images-gray-changed', icon: ICON_IMAGE },
 ]
 
 const rasterOptions = [
@@ -236,6 +253,7 @@ const setRaster = (mode) => {
   state.rasterMode = state.rasterMode === mode ? 'lines' : mode
   setStoredViewSetting('rasterMode', state.rasterMode)
   eventBus.emit('raster-mode-changed', state.rasterMode)
+  eventBus.emit('time-basis-changed', state.showMachineEstimate)
 }
 
 // Debug modes are mutually exclusive: turning one on turns the other off (and a
@@ -252,6 +270,15 @@ const toggleKey = (key, event) => {
   }
   state[key] = turningOn
   emit(key, event)
+}
+
+// Machine estimate vs. real run time. Both numbers come out of the same
+// toolpath build; this only picks which one the cards and the playback clock
+// show (see ThreeViewer's publishStats).
+const toggleMachineEstimate = () => {
+  state.showMachineEstimate = !state.showMachineEstimate
+  setStoredViewSetting('showMachineEstimate', state.showMachineEstimate)
+  eventBus.emit('time-basis-changed', state.showMachineEstimate)
 }
 
 // Curve fidelity: passed straight to toolpath.js's tessellation tolerance.
@@ -278,7 +305,9 @@ onMounted(() => {
   // brings THOSE back in sync after a reload.
   eventBus.emit('show-travel-changed', state.showTravel)
   eventBus.emit('rulers-changed', state.showRulers)
+  eventBus.emit('images-gray-changed', state.imagesGray)
   eventBus.emit('raster-mode-changed', state.rasterMode)
+  eventBus.emit('time-basis-changed', state.showMachineEstimate)
   eventBus.emit('debug-colors-changed', state.debugColors)
   eventBus.emit('speed-gradient-changed', state.speedGradient)
   eventBus.emit('tessellation-changed', tessOptions.find((o) => o.key === state.tessellation)?.tol ?? TESSELLATION_TOL_BY_KEY.normal)
@@ -287,6 +316,14 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 </script>
 
 <style scoped>
+/* Hairline between the two colour modes and the time switch - they sit in one
+   flyout but are unrelated settings. */
+.vt-sep {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--panel-border);
+}
+
 .view-toggles {
   /* Placement now comes from the shared .top-right-controls column in
      App.vue, this is just the (still vertical) group of its own 4 buttons. */

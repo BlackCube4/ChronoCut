@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Never touch line endings in binary formats. A small PDF without NUL bytes
+# (e.g. edge_leer.pdf) is otherwise auto-detected as TEXT and gets its line
+# endings rewritten, which corrupts it.
+*.pdf  binary
+*.xlsx binary
+*.png  binary
+*.jpg  binary
+*.npy  binary
+*.pptx binary

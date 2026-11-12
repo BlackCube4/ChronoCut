@@ -96,24 +96,34 @@ def _normalize_svg_style_conflicts(raw: bytes) -> bytes:
     return ET.tostring(root, encoding="utf-8")
 
 
-# ── Watermark stripping ───────────────────────────────────────────────────────
-# Find the (mm) bounding boxes of watermark phrases on a page, then drop any
-# extracted vector/text whose centre lands inside one. Coordinates match the
+# ── Watermark detection ───────────────────────────────────────────────────────
+# Find the (mm) bounding boxes of watermark phrases on a page, then TAG (wm=True)
+# any extracted vector/text whose centre lands inside one. Nothing is removed
+# here: ChronoCut is meant to show what the laser would actually get, watermark
+# included. The "Wasserzeichen entfernen" edit in the viewer drops tagged
+# objects on request (toolpath.js removeWatermarks). Coordinates match the
 # norm_x/norm_y space used for the objects.
 
 def _watermark_boxes(page, watermarks):
+    """Box of every TEXT LINE that contains a watermark phrase - the whole line,
+    not just the phrase: "PRODUCED BY AN AUTODESK STUDENT VERSION" must go
+    completely, not only its "STUDENT VERSION" half."""
+    phrases = [p.strip().casefold() for p in (watermarks or []) if (p or "").strip()]
+    if not phrases:
+        return []
     boxes = []
-    for txt in (watermarks or []):
-        t = (txt or "").strip()
-        if not t:
-            continue
-        try:
-            for r in page.search_for(t):   # case-insensitive; returns Rects in points
-                xs = sorted((norm_x(r.x0), norm_x(r.x1)))
-                ys = sorted((norm_y(r.y0), norm_y(r.y1)))
-                boxes.append((xs[0] - 0.5, ys[0] - 0.5, xs[1] + 0.5, ys[1] + 0.5))
-        except Exception as e:
-            print(f"[watermark] search '{t}' failed: {e}")
+    try:
+        for block in page.get_text("dict")["blocks"]:
+            for ln in block.get("lines", []):
+                text = "".join(s["text"] for s in ln["spans"]).casefold()
+                compact = text.replace(" ", "")
+                if any(p in text or p.replace(" ", "") in compact for p in phrases):
+                    x0, y0, x1, y1 = ln["bbox"]
+                    xs = sorted((norm_x(x0), norm_x(x1)))
+                    ys = sorted((norm_y(y0), norm_y(y1)))
+                    boxes.append((xs[0] - 0.5, ys[0] - 0.5, xs[1] + 0.5, ys[1] + 0.5))
+    except Exception as e:
+        print(f"[watermark] text scan failed: {e}")
     return boxes
 
 
@@ -130,6 +140,31 @@ def _obj_center(o: Dict):
             return None
         return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     return None
+
+
+# Archicad educational exports carry two marks:
+#   * an invisible 4 pt WHITE text "GSEducationalVersion" in a corner - handled
+#     like any watermark phrase (listed in watermarks.xml);
+#   * the visible "ARCHICAD BILDUNGSVERSION" stamp, which is NOT text but a small
+#     transparent PNG near the top-right corner (80 x 19 mm in the A0 exports).
+# The stamp image is only tagged when the marker text is on the same page, so no
+# image is ever offered for removal from a file that isn't an Archicad
+# educational export.
+ARCHICAD_EDU_MARKER = "GSEducationalVersion"
+
+
+def _is_edu_stamp(doc, info: dict) -> bool:
+    xref = info.get("xref", 0)
+    if not xref:
+        return False
+    x0, y0, x1, y1 = info["bbox"]
+    w_mm, h_mm = abs(x1 - x0) * MM_PER_PT, abs(y1 - y0) * MM_PER_PT
+    if h_mm <= 0 or w_mm > 150 or w_mm / h_mm < 3:   # small, wide banner only
+        return False
+    try:
+        return bool(doc.extract_image(xref).get("smask"))   # transparent background
+    except Exception:
+        return False
 
 
 def _in_watermark(o: Dict, boxes) -> bool:
@@ -150,7 +185,8 @@ async def extract_pdf_lines(file: UploadFile = File(...)):
 
     Text is converted to filled vector paths automatically (via MuPDF's
     text_as_path SVG export), preserving the original fill colour. Any text/vector
-    inside a region matching a phrase in backend/watermarks.xml is dropped.
+    inside a region matching a phrase in backend/watermarks.xml is tagged wm=True
+    (kept, so the user sees it; the viewer removes it on request).
     """
     name = file.filename.lower()
     if name.endswith(".pdf"):
@@ -183,6 +219,12 @@ def extract_sync(file_bytes: bytes, filetype: str = "pdf", watermarks=None) -> d
     if filetype == "svg":
         file_bytes = _normalize_svg_style_conflicts(file_bytes)
     doc = pymupdf.open(stream=file_bytes, filetype=filetype)
+    if filetype == "svg":
+        # MuPDF draws an SVG's <image>s, but inside an SVG document they have no
+        # xref, so _extract_image() could not read them back and every embedded
+        # bitmap was silently dropped. As a PDF they get one; vectors and text
+        # come out the same (checked on all calibration + tool-test SVGs).
+        doc = pymupdf.open("pdf", doc.convert_to_pdf())
     objects: List[Dict] = []
     page_num = 0
 
@@ -197,9 +239,11 @@ def extract_sync(file_bytes: bytes, filetype: str = "pdf", watermarks=None) -> d
         print(f"[extract] {filetype} page0 = {page_w_pt:.1f}x{page_h_pt:.1f} pt "
               f"= {pt2mm(page_w_pt):.1f}x{pt2mm(page_h_pt):.1f} mm")
 
+        pid = 0   # source path id, see _append_strokes
         for page_num in range(len(doc)):
             page = doc[page_num]
             wm_boxes = _watermark_boxes(page, watermarks)
+            edu = bool(page.search_for(ARCHICAD_EDU_MARKER))
             start = len(objects)
 
             # Vectors + text → convert text to paths via SVG round-trip, then
@@ -219,25 +263,30 @@ def extract_sync(file_bytes: bytes, filetype: str = "pdf", watermarks=None) -> d
                     if fp:
                         objects.append(fp)
                 if drw.get("color") is not None:
-                    _append_strokes(objects, drw)
+                    pid += 1
+                    _append_strokes(objects, drw, pid)
 
             # Raster images (engraving bitmaps) - from the ORIGINAL page.
             try:
                 for info in page.get_image_info(xrefs=True):
                     entry = _extract_image(page.parent, info)
                     if entry:
+                        if edu and _is_edu_stamp(page.parent, info):
+                            entry["wm"] = True
+                            print(f"[extract] page {page_num}: Archicad educational stamp image tagged")
                         objects.append(entry)
             except Exception as e:
                 print(f"[extract] image extraction failed: {e}")
 
-            # Drop vectors/text that fall inside a watermark text region.
+            # Tag vectors/text that fall inside a watermark text region.
             if wm_boxes:
-                kept = [o for o in objects[start:] if not _in_watermark(o, wm_boxes)]
-                removed = len(objects) - start - len(kept)
-                if removed:
-                    print(f"[extract] page {page_num}: removed {removed} watermark objects")
-                del objects[start:]
-                objects.extend(kept)
+                tagged = 0
+                for o in objects[start:]:
+                    if _in_watermark(o, wm_boxes):
+                        o["wm"] = True
+                        tagged += 1
+                if tagged:
+                    print(f"[extract] page {page_num}: {tagged} watermark objects tagged")
 
     finally:
         _save_debug(objects, page_num)
@@ -324,7 +373,11 @@ def _build_fp(drw: dict) -> Dict | None:
 
 # ── Stroke items ──────────────────────────────────────────────────────────────
 
-def _append_strokes(objects: list, drw: dict):
+def _append_strokes(objects: list, drw: dict, pid: int):
+    """One entry per line/bezier. `pid` marks which source path object each
+    piece came from, so the export can write the path back as ONE object
+    (api_save_pdf.build_pdf) and "Kurven verbinden" can tell already-joined
+    paths from separately drawn pieces."""
     color = rgb_to_hex(drw["color"])
     for item in drw["items"]:
         kind = item[0]
@@ -332,20 +385,21 @@ def _append_strokes(objects: list, drw: dict):
             s, e = item[1], item[2]
             objects.append({"type": "l",
                             "x1": norm_x(s.x), "y1": norm_y(s.y),
-                            "x2": norm_x(e.x), "y2": norm_y(e.y), "color": color})
+                            "x2": norm_x(e.x), "y2": norm_y(e.y), "color": color, "pid": pid})
         elif kind == "re":
             r = item[1]
             x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
             for sx, sy, ex, ey in [(x0,y0,x1,y0),(x1,y0,x1,y1),(x1,y1,x0,y1),(x0,y1,x0,y0)]:
                 objects.append({"type": "l",
                                 "x1": norm_x(sx), "y1": norm_y(sy),
-                                "x2": norm_x(ex), "y2": norm_y(ey), "color": color})
+                                "x2": norm_x(ex), "y2": norm_y(ey), "color": color, "pid": pid})
         elif kind == "c":
             objects.append({"type": "c",
                             "x1": norm_x(item[1].x), "y1": norm_y(item[1].y),
                             "x2": norm_x(item[2].x), "y2": norm_y(item[2].y),
                             "x3": norm_x(item[3].x), "y3": norm_y(item[3].y),
-                            "x4": norm_x(item[4].x), "y4": norm_y(item[4].y), "color": color})
+                            "x4": norm_x(item[4].x), "y4": norm_y(item[4].y), "color": color,
+                            "pid": pid})
         elif kind == "qu":
             # MuPDF folds four consecutive line segments into a Quad - including
             # DEGENERATE ones, e.g. a stroke that runs back and forth over the same
@@ -357,7 +411,7 @@ def _append_strokes(objects: list, drw: dict):
             for a, b in zip(corners, corners[1:]):
                 objects.append({"type": "l",
                                 "x1": norm_x(a.x), "y1": norm_y(a.y),
-                                "x2": norm_x(b.x), "y2": norm_y(b.y), "color": color})
+                                "x2": norm_x(b.x), "y2": norm_y(b.y), "color": color, "pid": pid})
 
 
 # ── Embedded image extraction ─────────────────────────────────────────────────
@@ -376,10 +430,21 @@ def _extract_image(doc, info: dict) -> Dict | None:
         if w_mm < 0.5 or h_mm < 0.5:
             return None
 
-        ext  = img["ext"]
+        ext, raw, alpha = img["ext"], img["image"], False
+        smask = img.get("smask")
+        if smask:
+            # Apply the soft mask, so a transparent image (e.g. Archicad's
+            # "BILDUNGSVERSION" stamp) shows as itself instead of its opaque
+            # base image on a black box.
+            try:
+                pix = pymupdf.Pixmap(pymupdf.Pixmap(doc, xref), pymupdf.Pixmap(doc, smask))
+                ext, raw, alpha = "png", pix.tobytes("png"), True
+            except Exception as e:
+                print(f"[extract] image xref={xref} smask failed: {e}")
         mime = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg"}.get(ext, "image/png")
-        b64  = base64.b64encode(img["image"]).decode("ascii")
+        b64  = base64.b64encode(raw).decode("ascii")
         return {
+            "alpha": alpha,
             "type": "img",
             "x": norm_x(min(x0, x1)),
             "y": norm_y(min(y0, y1)),      # top-left corner

@@ -82,13 +82,31 @@ def build_pdf(objects: List[Dict[str, Any]]) -> io.BytesIO:
         if o.get("type") == "img":
             _insert_image(page, o)
 
+    # Consecutive strokes that share a `pid` (one source path from the
+    # extraction, or one chain from "Kurven verbinden") go out as ONE path
+    # object. Writing every piece as its own path is exactly what makes a
+    # laser treat a smooth contour as thousands of separate vectors.
     shape = page.new_shape()
+    group = None   # (pid, color) of the stroke path currently open in `shape`
+
+    def flush():
+        nonlocal group
+        if group is not None:
+            shape.finish(color=hex_to_rgb(group[1]), width=STROKE_WIDTH_PT, closePath=False)
+            group = None
+
     for o in objects:
         t = o.get("type")
         if t == "fp":
+            flush()
             _draw_fill(shape, o)
         elif t in ("l", "c"):
+            key = (o.get("pid"), o.get("color", "#000000"))
+            if group is None or key[0] is None or key != group:
+                flush()
+                group = key
             _draw_stroke(shape, o)
+    flush()
     shape.commit()
 
     pdf_buffer = io.BytesIO()
@@ -98,7 +116,7 @@ def build_pdf(objects: List[Dict[str, Any]]) -> io.BytesIO:
     return pdf_buffer
 
 def _draw_stroke(shape, o: Dict[str, Any]):
-    color = hex_to_rgb(o.get("color", "#000000"))
+    """Add one line/bezier to the open path; build_pdf finishes it (stroke)."""
     if o["type"] == "l":
         shape.draw_line(
             (mm_to_pt_x(o["x1"]), mm_to_pt_y(o["y1"])),
@@ -111,7 +129,6 @@ def _draw_stroke(shape, o: Dict[str, Any]):
             (mm_to_pt_x(o["x3"]), mm_to_pt_y(o["y3"])),
             (mm_to_pt_x(o["x4"]), mm_to_pt_y(o["y4"])),
         )
-    shape.finish(color=color, width=STROKE_WIDTH_PT, closePath=False)
 
 
 def _draw_fill(shape, o: Dict[str, Any]):
