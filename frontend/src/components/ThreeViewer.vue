@@ -1110,8 +1110,17 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
   const flushHeadRun = () => { if (headRun) { headRuns.push(headRun); headRun = null } }
 
   for (const m of moves) {
-    const speed = (m.category === 'raster' ? (currentSpeeds.raster ?? currentSpeeds.engrave)
-                                           : currentSpeeds[m.kind]) || currentSpeeds.other || SPEED_MM_S.other
+    let speed = m.v ?? ((m.category === 'raster' ? (currentSpeeds.raster ?? currentSpeeds.engrave)
+                                                 : currentSpeeds[m.kind]) || currentSpeeds.other || SPEED_MM_S.other)
+    // Raster: the per-line / per-band overheads are spread over the scan (the
+    // head turns at every row end) instead of a standstill after the band.
+    let extraAfter = moveExtraTime(m)
+    if (m.category === 'raster' && extraAfter > 0) {
+      const rp = movePolyline(m)
+      let S = 0
+      for (let i = 1; i < rp.length; i++) S += dist(rp[i - 1], rp[i])
+      if (S > 0 && speed > 0) { speed = S / (S / speed + extraAfter); extraAfter = 0 }
+    }
     // View-only: a hidden colour's moves still run through the timeline below
     // exactly as before (runTime/headRun keep advancing unconditionally) so
     // the estimate and playback clock stay correct - only the geometry that
@@ -1125,7 +1134,7 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
       // same duration so the overall timeline matches the scan-line version.
       flushHeadRun()
       const dur = rampSegments(movePolyline(m), speed, accelFor(m, currentAccel),
-                               cornerPenaltyFor(m)).total + moveExtraTime(m)
+                               cornerPenaltyFor(m)).total + extraAfter   // overheads already in speed
       if (!hidden) {
         rasterBlocks.push({ bbox: m.bbox, t0: runTime, t1: runTime + dur, color: lineRGB(m.color) })
         // The block is revealed top-to-bottom over its span, so bin its rows
@@ -1195,7 +1204,7 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
       }
       headRun.pts.push(q); headRun.cum.push(info.s1); headRun.T += info.dur
     }
-    runTime += moveExtraTime(m)   // keep the clock equal to stats.totalTime
+    runTime += extraAfter   // keep the clock equal to stats.totalTime
   }
   flushHeadRun()
   // Sorted by time bin so lasedBox() can stop at the first bin past the cursor.

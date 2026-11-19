@@ -150,9 +150,11 @@ export const cornerPenaltyFor = (m) => (m.category === 'raster' ? 0 : (m.p0 ?? C
 //            travel in between) still costs a full stop (m.joined), see
 //            calibration.js objectStopPenalty.
 export const moveExtraTime = (m) => {
-  if (m.kind === 'travel') return m.home ? 0 : (m.pv ?? CALIBRATION.vectorStartPenalty)   // home leg starts no vector
+  // home leg and raster approach start no vector
+  if (m.kind === 'travel') return (m.home || m.approach) ? 0 : (m.pv ?? CALIBRATION.vectorStartPenalty)
   if (m.category === 'raster' && m.rows) {
     return (CALIBRATION.rasterBandOverhead || 0) + m.rows * (m.lineOverhead + CALIBRATION.rasterYFeed * m.pitch)
+      - (m.approachTime || 0)
   }
   if (m.prims) return m.joined ? CALIBRATION.objectStopPenalty : 0
   return 0
@@ -2054,6 +2056,7 @@ function optimizeOrder(paths, startPos, algo = DEFAULT_PATH_ORDER) {
 // move's displayed time; raster keeps it and gets the per-line / per-height
 // correction.
 function realMoveTime(m, poly, forced, T, accel) {
+  if (m.approach) return T                    // part of the raster band's time
   if (m.category === 'raster') {
     return T + (m.rows ? m.rows * (REALITY.rasterPerLine + REALITY.rasterPerMmHeight * m.pitch) : 0)
   }
@@ -2172,9 +2175,13 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   // display by 5,9 %, charging approach and way back by 13,1 %; charging
   // neither lands at -0,7 %. And 52/53 (same two blocks, 5 mm vs 60 mm apart)
   // are both 379 s - crossing the gap costs nothing.
+  //
+  // The head still has to GET there, so the travel is kept as a move for the
+  // viewer (m.approach) - its time comes out of the band's fixed overhead
+  // (below), the total stays exactly what was measured.
   for (const band of bands) {
     const r = rasterRegion(band, lastPos, rasterPitch || RASTER_PITCH, rasterLineOverhead)
-    for (const m of r.moves) if (m.kind !== 'travel') moves.push(m)
+    for (const m of r.moves) moves.push(m.kind === 'travel' ? { ...m, approach: true } : m)
     lastPos = r.end
   }
 
@@ -2277,6 +2284,18 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     if (m.kind === 'travel') m.pv = K.vectorStartPenalty
     else m.p0 = K.cornerPenalty
   }
+  // Approach into a raster band: as long as the travel would take, but at most
+  // the band's fixed overhead, which it is then taken out of (moveExtraTime).
+  // Driven at constant speed so it lasts exactly that long.
+  moves.forEach((m, i) => {
+    if (!m.approach) return
+    const band = moves[i + 1], L = dist(m.a, m.b)
+    const natural = rampedTime(L, m.v, accelFor(m, accel))
+    const t = Math.min(natural, band && band.category === 'raster' ? moveExtraTime(band) : 0)
+    if (band) band.approachTime = t
+    m.v = t > 0 ? L / t : 1e9
+    m.a0 = 0
+  })
   let realTime = 0      // the same moves with the machine's REAL kinematics
   for (const m of moves) {
     let L = 0
@@ -2285,11 +2304,12 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     // Acceleration-aware: ramps at every corner (each scan-line turnaround), so
     // the printer's accel value actually drives the estimate.
     const poly = movePolyline(m), forced = forcedStopsFor(m)
-    const ramp = rampSegments(poly, speedFor(m), accelFor(m, accel), cornerPenaltyFor(m), forced)
+    const ramp = rampSegments(poly, m.v, accelFor(m, accel), cornerPenaltyFor(m), forced)
     const T = ramp.total + moveExtraTime(m)
     realTime += realMoveTime(m, poly, forced, T, accel)
 
-    if      (m.kind === 'travel')     { stats.travelLen  += L; stats.travelTime  += T }
+    if      (m.approach)              { stats.rasterTime += T }   // belongs to the band
+    else if (m.kind === 'travel')     { stats.travelLen  += L; stats.travelTime  += T }
     else if (m.kind === 'cut')        { stats.cutLen     += L; stats.cutTime     += T }
     else if (m.category === 'raster') { stats.rasterLen  += L; stats.rasterTime  += T }
     else if (m.kind === 'engrave')    { stats.engraveLen += L; stats.engraveTime += T }
