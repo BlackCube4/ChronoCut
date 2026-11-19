@@ -233,7 +233,7 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, force
   }
   const durs = new Array(n).fill(0)
   const speeds = new Array(n).fill(v)
-  let total = 0
+  let total = 0, runs = 0
   for (let rs = 0; rs < n; ) {
     let re = rs + 1
     while (re < n && !stop[re]) re++          // run = segments [rs, re)
@@ -249,8 +249,10 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, force
       s0 = s1
     }
     rs = re
+    runs++
   }
-  return { durs, speeds, total }
+  // runs - 1 = full stops INSIDE the polyline (REALITY.vectorPerStop counts them).
+  return { durs, speeds, total, runs }
 }
 
 /**
@@ -344,12 +346,52 @@ const PURE_RED   = '#ff0000'
 const PURE_BLUE  = '#0000ff'
 const PURE_GREEN = '#00ff00'
 
+// Grober Fangbereich fuer "Farben korrigieren", gedacht fuer Anfaenger, die
+// "irgendein Rot" oder "irgendein Blau" gewaehlt haben (#c00000, #e03030,
+// dunkelrot, #3366ff, marineblau ...). Bewusst GROB und ohne Regler: wer
+// absichtlich Sonderfarben nutzt, hat Rot und Blau ohnehin exakt eingetragen.
+// Massgeblich ist der Farbton, damit Orange (~30°), Gelb (60°), Cyan (180°)
+// und Violett (~280°) NICHT gefangen werden. Fast-Grau und fast-Schwarz
+// bleiben ebenfalls, wie sie sind (zu wenig Saettigung bzw. Helligkeit).
+// categorize() bleibt streng - sie entscheidet ueber das Routing ohne Klick.
+const SNAP_HUE = {           // [von, bis] in Grad, Bereich darf ueber 0° laufen
+  red:   [340, 18],
+  blue:  [205, 262],
+  green: [85, 155],
+}
+const SNAP_MIN_SAT = 0.45    // HSV-Saettigung
+const SNAP_MIN_VAL = 0.25    // HSV-Helligkeit (dunkelrot #800000 = 0,5 zaehlt)
+
+function hsv(hex) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255
+  const g = parseInt(hex.slice(3, 5), 16) / 255
+  const b = parseInt(hex.slice(5, 7), 16) / 255
+  const max = Math.max(r, g, b), d = max - Math.min(r, g, b)
+  let h = 0
+  if (d > 0) {
+    if (max === r) h = 60 * (((g - b) / d) % 6)
+    else if (max === g) h = 60 * ((b - r) / d + 2)
+    else h = 60 * ((r - g) / d + 4)
+  }
+  return { h: (h + 360) % 360, s: max > 0 ? d / max : 0, v: max }
+}
+
+// Ziel-Reinfarbe fuer Striche (rot/blau) bzw. Fuellungen (gruen), sonst null.
+function snapTarget(hex, isFill) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex || '')) return null
+  const { h, s, v } = hsv(hex)
+  if (s < SNAP_MIN_SAT || v < SNAP_MIN_VAL) return null
+  const inHue = ([a, b]) => (a <= b ? h >= a && h <= b : h >= a || h <= b)
+  if (isFill) return inHue(SNAP_HUE.green) ? PURE_GREEN : null
+  if (inHue(SNAP_HUE.red)) return PURE_RED
+  if (inHue(SNAP_HUE.blue)) return PURE_BLUE
+  return null
+}
+
 /**
- * Snap near-pure colours to their canonical value, reusing the same
- * categorisation that drives cut/engrave routing:
- *   strokes (l/c)  almost-red  → #ff0000,  almost-blue → #0000ff
- *   fills   (fp)   almost-green → #00ff00
- * Everything else is left untouched. Returns a new array (shallow-copied items).
+ * Snap roughly-red / roughly-blue strokes and roughly-green fills to their
+ * canonical value (see SNAP_HUE). Everything else is left untouched.
+ * Returns a new array (shallow-copied items).
  */
 export function fixColors(data) {
   // Only clone (i.e. "change") an object when the colour ACTUALLY differs from the
@@ -357,11 +399,11 @@ export function fixColors(data) {
   // (a file that is already pure red/blue/green reports 0 fixed).
   return data.map((obj) => {
     if (obj.type === 'l' || obj.type === 'c') {
-      const cat = categorize(obj.color || '#000000')
-      if (cat === 'red')  return obj.color === PURE_RED  ? obj : { ...obj, color: PURE_RED }
-      if (cat === 'blue') return obj.color === PURE_BLUE ? obj : { ...obj, color: PURE_BLUE }
+      const t = snapTarget(obj.color, false)
+      if (t && obj.color.toLowerCase() !== t) return { ...obj, color: t }
     } else if (obj.type === 'fp') {
-      if (isGreen(obj.fill)) return obj.fill === PURE_GREEN ? obj : { ...obj, fill: PURE_GREEN }
+      const t = snapTarget(obj.fill, true)
+      if (t && obj.fill.toLowerCase() !== t) return { ...obj, fill: t }
     }
     return obj
   })
@@ -778,11 +820,11 @@ export function detectFixColors(data) {
   const segs = []
   for (const o of data) {
     if (o.type === 'l' || o.type === 'c') {
-      const cat = categorize(o.color || '#000000')
-      const target = cat === 'red' ? PURE_RED : cat === 'blue' ? PURE_BLUE : null
-      if (target && o.color !== target) { count++; segs.push(...strokeSegs(o)) }
-    } else if (o.type === 'fp' && isGreen(o.fill) && o.fill !== PURE_GREEN) {
-      count++; segs.push(...fpSegs(o.path))
+      const t = snapTarget(o.color, false)
+      if (t && o.color.toLowerCase() !== t) { count++; segs.push(...strokeSegs(o)) }
+    } else if (o.type === 'fp') {
+      const t = snapTarget(o.fill, true)
+      if (t && o.fill.toLowerCase() !== t) { count++; segs.push(...fpSegs(o.path)) }
     }
   }
   return { count, segs }
@@ -1852,14 +1894,17 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
       tinyBoxes.push(box)
     }
   }
+  let vectorStops = 0   // full stops inside vector contours (REALITY.vectorPerStop)
   for (const m of moves) {
     let L = 0
     if (m.kind === 'travel') L = dist(m.a, m.b)
     else for (const prim of m.prims) L += primLength(prim)
     // Acceleration-aware: ramps at every corner (each scan-line turnaround), so
     // the printer's accel value actually drives the estimate.
-    const T = rampSegments(movePolyline(m), speedFor(m), accelFor(m, accel),
-                           cornerPenaltyFor(m), forcedStopsFor(m)).total + moveExtraTime(m)
+    const ramp = rampSegments(movePolyline(m), speedFor(m), accelFor(m, accel),
+                              cornerPenaltyFor(m), forcedStopsFor(m))
+    const T = ramp.total + moveExtraTime(m)
+    if (m.kind !== 'travel' && m.category !== 'raster') vectorStops += Math.max(0, ramp.runs - 1)
 
     if      (m.kind === 'travel')     { stats.travelLen  += L; stats.travelTime  += T }
     else if (m.kind === 'cut')        { stats.cutLen     += L; stats.cutTime     += T }
@@ -1872,10 +1917,11 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
 
   // ── Anzeige → Realität ──────────────────────────────────────────────────
   // Everything above reproduces what the Job Manager DISPLAYS. The machine's
-  // actual run time differs from it systematically (25 stopwatch runs, see
+  // actual run time differs from it systematically (116 stopwatch runs, see
   // calibration.js REALITY): raster finishes early, vector with a lot of travel
-  // runs late. stats.displayTime keeps the machine's own number, stats.totalTime
-  // becomes the one that matters - how long the job really takes.
+  // or many corner stops runs late. stats.displayTime keeps the machine's own
+  // number, stats.totalTime becomes the one that matters - how long the job
+  // really takes.
   stats.displayTime = stats.totalTime
   let rasterRows = 0, rasterHeight = 0, contours = 0
   for (const m of moves) {
@@ -1887,6 +1933,7 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
     + REALITY.rasterPerMmHeight * rasterHeight
     + REALITY.vectorPerContour * contours
     + REALITY.vectorPerMmTravel * stats.travelLen
+    + REALITY.vectorPerStop * vectorStops
   stats.totalTime = Math.max(0, stats.displayTime + stats.realDelta)
 
   return { moves, stats, tinyBoxes }

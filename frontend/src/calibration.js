@@ -1,23 +1,39 @@
 // Gemessene Maschinenkonstanten - Epilog Fusion ("Edgar", 60 W).
 //
-// Quelle: 61 Kalibrierdateien / 87 Läufe. Fit-Skript und Rohdaten:
-// docs/calib/fit_model.py, Auswertung: docs/CALIBRATION.md.
+// Quelle: 61 Kalibrierdateien. Fit-Skripte und Rohdaten: docs/calib/fit_model.py
+// (Anzeige) und docs/calib/fit_reality.mjs (Realität), Auswertung:
+// docs/CALIBRATION.md.
 //
 // ZWEI SCHICHTEN, weil es zwei verschiedene Größen gibt:
 //
-//   1. Die vom Job Manager ANGEZEIGTE Schätzung. Die ist mit 87 Läufen dicht
-//      belegt und wird von CALIBRATION unten auf Ø 0,60 % getroffen.
-//   2. Die Zeit, die die Maschine TATSÄCHLICH braucht. 25 Läufe sind mit der
-//      Uhr gestoppt, und sie weichen systematisch ab: Raster läuft schneller
-//      als angezeigt, Vektor mit viel Leerweg langsamer. REALITY unten ist
-//      die Korrektur von (1) auf (2).
+//   1. Die vom Job Manager ANGEZEIGTE Schätzung. CALIBRATION unten trifft sie
+//      bei 8 % Vektor auf Ø 0,74 %, beim Raster auf Ø 0,54 %.
+//   2. Die Zeit, die die Maschine TATSÄCHLICH braucht. 116 Werte hat der
+//      Cutter nach dem Lauf angezeigt (ganze Sekunden), und sie weichen
+//      systematisch ab: Raster läuft schneller als angezeigt, Vektor mit viel
+//      Leerweg oder vielen Eckhalten langsamer.
+//      REALITY unten ist die Korrektur von (1) auf (2).
 //
 // Die App zeigt (2) - danach richtet sich, wie lange der Job wirklich dauert.
 // (1) bleibt über stats.displayTime verfügbar, weil das die Zahl ist, die am
 // Gerät steht.
 //
-// George (120 W) ist baugleich; die Zeitschätzung ist rein kinematisch und
-// hängt nicht an der Laserleistung. Bis Stichproben vorliegen: gleiche Werte.
+// VIERTE MESSREIHE (Oktober 2026), bewusst NICHT in CALIBRATION übernommen:
+// die Vektorreihe bei 100 % trifft dieses Modell nur auf Ø 8 % (15_polygon_12
+// mit "Optimieren": angezeigt 20 s, Modell 29 s). Ein Neufit über alle Läufe
+// holt 100 % auf Ø 3,7 %, macht aber 8 % schlechter (1,2 %). Die Ursache ist
+// das Eckenmodell: eine Ecke ist hier entweder ein voller Halt (Knick über
+// cornerAngleDeg) oder nichts - bei hoher Geschwindigkeit bremst die Maschine
+// an mittleren Ecken aber nur ab. Erst mit einem Modell dafür lässt sich die
+// Beschleunigung aus den 100-%-Daten sauber bestimmen. Dafür ist der kompakte
+// Messsatz 80-93 gebaut (docs/CALIBRATION.md Abschnitt 8).
+//
+// Das Blatt "Messprotokoll Real" (Produktionsdateien) ist noch nicht
+// verlässlich gemessen und fließt in KEINEN Fit ein; extract_protocol.py liest
+// nur das Blatt "Messprotokoll".
+//
+// George (120 W) ist baugleich: sechs Stichproben (Vektor und Raster) zeigen
+// im Job Manager exakt dieselben Zeiten wie Edgar. Gleiche Werte für beide.
 
 export const CALIBRATION = {
   // ── Vektor (Schnitt + Vektorgravur) ────────────────────────────────────────
@@ -121,26 +137,23 @@ export function rasterPctForSpeed(v) {
 
 // ── Anzeige → Realität ───────────────────────────────────────────────────────
 //
-// 25 Läufe sind mit der Uhr gestoppt. Die Abweichung von der Anzeige ist nicht
-// zufällig, sondern hat in beiden Domänen eine klare Form:
+// 116 Werte hat der Cutter nach dem Lauf angezeigt (58 Läufe bei 8-100 %,
+// mit und ohne "Optimieren"; 01/02 mit "1 s" ausgenommen). Gefittet mit
+// docs/calib/fit_reality.mjs gegen die im Job Manager ABGELESENE Zahl, nicht
+// gegen die Modell-Anzeige - so trägt diese Schicht nur den echten
+// Unterschied Schätzung -> gemessene Zeit und keine Fehler des Anzeige-Modells.
 //
 //   RASTER läuft SCHNELLER als angezeigt - die Anzeige veranschlagt je
-//   Scanzeile und je mm Gravurhöhe mehr, als die Maschine braucht. Zwei Terme
-//   reproduzieren alle neun Rastermessungen auf 0,7 s genau, über 200 bis 1890
-//   Zeilen und 25 bis 80 mm Höhe - besser als die ±0,5 s, mit denen die beiden
-//   abgelesenen Zahlen selbst behaftet sind.
+//   Scanzeile und je mm Gravurhöhe mehr, als die Maschine braucht.
 //
-//   VEKTOR läuft LANGSAMER als angezeigt, und zwar proportional zum Leerweg:
-//   0,645 ms je mm entspricht einem echten Eilgang von 215 statt der 250 mm/s,
-//   mit denen die Anzeige rechnet. Dazu 9,4 ms je Kontur. 56/57 (400/800
-//   Konturen, kaum Leerweg) und 41/61 (viel Leerweg) trennen die beiden Terme.
-//
-// Nicht erfasst bleibt ein Rest von bis zu 3 s auf den langen Einzelkontur-
-// Läufen (07_vline_250: angezeigt 248 s, gestoppt 245 s) - 1,2 %, in der
-// Größenordnung der Ablesegenauigkeit.
+//   VEKTOR läuft LANGSAMER als angezeigt: proportional zum Leerweg (0,659 ms je
+//   mm = echter Eilgang 215 statt der 250 mm/s der Anzeige, passt zur
+//   Kameramessung), je Kontur, und - neu, aus der gemessenen Zickzack-Reihe -
+//   je vollem Halt innerhalb einer Kontur.
 export const REALITY = {
-  rasterPerLine: -0.01267,   // s je Scanzeile
-  rasterPerMmHeight: -0.1233, // s je mm gescannter Höhe
-  vectorPerContour: 0.00939, // s je separatem Vektor
-  vectorPerMmTravel: 0.000645, // s je mm Leerweg (= 215 statt 250 mm/s)
+  rasterPerLine: -0.01236,     // s je Scanzeile
+  rasterPerMmHeight: -0.1235,  // s je mm gescannter Höhe
+  vectorPerContour: 0.00848,   // s je separatem Vektor
+  vectorPerMmTravel: 0.000659, // s je mm Leerweg (= 215 statt 250 mm/s)
+  vectorPerStop: 0.00846,      // s je vollem Halt innerhalb einer Kontur
 }
