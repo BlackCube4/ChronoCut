@@ -5,9 +5,9 @@ George) before it is sent, and cleans up drawings for laser cutting (colours,
 doubles, tiny segments, watermarks, joining curves).
 
 **Everything runs in the browser.** PDF and SVG files are read and written on
-the user's own computer (MuPDF compiled to WebAssembly). Nothing is uploaded,
-and there is no server-side code: hosting ChronoCut means serving a folder of
-static files.
+the user's own computer (pdf.js and pdf-lib). Nothing is uploaded, and there
+is no server-side code: hosting ChronoCut means serving a folder of static
+files.
 
 ## Requirements
 
@@ -80,9 +80,9 @@ docker compose up -d --build
   the app only receives GET requests.
 - The app works from a sub path too (e.g. `https://server/chronocut/`), the
   build uses relative paths.
-- The PDF engine is a ~10 MB `.wasm` file (~5 MB compressed). Browsers cache
-  it after the first visit. The included nginx config serves it compressed
-  and with long cache times (`docker/nginx.conf`).
+- The whole app is about 6 MB (PDF engine and substitute fonts included).
+  Browsers cache it after the first visit. The included nginx config serves
+  it compressed and with long cache times (`docker/nginx.conf`).
 
 ### Without Docker
 
@@ -94,10 +94,10 @@ npm ci
 npm run build
 ```
 
-and copy the contents of `frontend/dist/` to the web server. The server must
-send `.wasm` files as `application/wasm` (current nginx and Apache do that by
-default). Opening `dist/index.html` directly from disk does not work: browsers
-only run the PDF engine when the page comes from a web server.
+and copy the contents of `frontend/dist/` to the web server (including the
+`pdfjs/` folder: substitute fonts for PDFs that do not embed theirs). Opening
+`dist/index.html` directly from disk does not work: browsers only run the PDF
+engine when the page comes from a web server.
 
 ## Adding a printer
 
@@ -116,9 +116,21 @@ file.
 | `laser time calibration/` | Calibration files, measurement protocol and test files for the tools. |
 | `docker/` | nginx configuration for the container. |
 
-## Licence
+## Third-party software
 
-ChronoCut uses [MuPDF](https://mupdf.com/) (via the `mupdf` npm package),
-which is licensed under the GNU AGPL v3. Anyone who uses a hosted copy must
-be able to get the source code of that copy, e.g. through a link to this
-repository.
+All libraries are under permissive licences, so ChronoCut itself can be
+published under any licence, closed source included. Their licence texts
+must stay with the app (they are in `node_modules/<package>/` and, for the
+files shipped as-is, in `dist/pdfjs/`).
+
+| Component | Used for | Licence |
+|---|---|---|
+| [pdf.js](https://github.com/mozilla/pdf.js) (`pdfjs-dist`) | reading PDFs | Apache 2.0 |
+| [pdf-lib](https://github.com/Hopding/pdf-lib) | writing PDFs | MIT |
+| [opentype.js](https://github.com/opentypejs/opentype.js) | text to outlines | MIT |
+| [fflate](https://github.com/101arrowz/fflate) | PNG compression | MIT |
+| Vue, Three.js, axios, mitt, pinia, vue-router | app | MIT |
+| Inter (`@fontsource/inter`) | UI font | SIL OFL 1.1 |
+| Foxit fonts (shipped by pdf.js) | substitute fonts | BSD-style (PDFium) |
+| Liberation Sans (shipped by pdf.js) | substitute font | GPL 2 with font exception, a separate data file |
+| JBIG2 / OpenJPEG / QCMS decoders (shipped by pdf.js) | rare image formats | BSD / MIT |

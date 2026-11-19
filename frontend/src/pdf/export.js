@@ -1,10 +1,9 @@
-// Drawing objects -> PDF, in the browser (mupdf.js). Port of the former backend
-// module backend/api/api_save_pdf.py.
+// Drawing objects -> PDF, in the browser, with pdf-lib (MIT).
 //
 // Takes the same object list extractDocument() produces (l / c / fp / img /
 // mbox), usually after the edit tools ran, and writes one PDF page with
 // everything the source had (vectors, text outlines, images), just corrected.
-
+import { PDFDocument } from 'pdf-lib'
 import { MM_PER_PT } from './extract.js'
 
 // Default stroke width for cut/engrave lines (the extraction does not keep the
@@ -27,8 +26,8 @@ function base64ToBytes(b64) {
   return out
 }
 
-/** @returns {Uint8Array} the PDF file */
-export function buildPdf(mupdf, objects) {
+/** @returns {Promise<Uint8Array>} the PDF file */
+export async function buildPdf(objects) {
   // Page size from the mbox entry (mm -> pt); A4 if absent.
   let W = 595, H = 842
   const mbox = objects.find((o) => o.type === 'mbox')
@@ -39,20 +38,20 @@ export function buildPdf(mupdf, objects) {
   const X = (xmm) => f(xmm / MM_PER_PT)
   const Y = (ymm) => f(H + ymm / MM_PER_PT)
 
-  const doc = new mupdf.PDFDocument()
-  const xobjects = {}
+  const doc = await PDFDocument.create()
+  const page = doc.addPage([W, H])
   const ops = []
 
   // Images first (background), then vector geometry on top.
-  let imgN = 0
   for (const o of objects) {
     if (o.type !== 'img' || !(o.data || '').includes(',')) continue
     try {
-      const image = new mupdf.Image(base64ToBytes(o.data.split(',', 2)[1]))
-      const name = `Im${imgN++}`
-      xobjects[name] = doc.addImage(image)
+      const [head, b64] = o.data.split(',', 2)
+      const bytes = base64ToBytes(b64)
+      const image = /jpe?g/i.test(head) ? await doc.embedJpg(bytes) : await doc.embedPng(bytes)
+      const name = page.node.newXObject('Im', image.ref)
       const w = o.w / MM_PER_PT, h = o.h / MM_PER_PT
-      ops.push(`q ${f(w)} 0 0 ${f(h)} ${X(o.x)} ${f(H + o.y / MM_PER_PT - h)} cm /${name} Do Q`)
+      ops.push(`q ${f(w)} 0 0 ${f(h)} ${X(o.x)} ${f(H + o.y / MM_PER_PT - h)} cm ${name.toString()} Do Q`)
     } catch (e) {
       console.warn('[save_pdf] image failed', e)
     }
@@ -68,9 +67,6 @@ export function buildPdf(mupdf, objects) {
     if (group) ops.push('S Q')
     group = null
     last = null
-  }
-  const moveIfGap = (x, y) => {
-    if (!last || last[0] !== x || last[1] !== y) ops.push(`${x} ${y} m`)
   }
 
   for (const o of objects) {
@@ -91,9 +87,7 @@ export function buildPdf(mupdf, objects) {
         }
       }
       // even-odd, so holes (letter counters) render regardless of winding
-      if (sub.some((s) => s.endsWith(' l') || s.endsWith(' c'))) {
-        ops.push(`q ${rgb(o.fill)} rg`, ...sub, 'h f* Q')
-      }
+      if (sub.some((s) => s.endsWith(' l') || s.endsWith(' c'))) ops.push(`q ${rgb(o.fill)} rg`, ...sub, 'h f* Q')
     } else if (o.type === 'l' || o.type === 'c') {
       const key = [o.pid, o.color || '#000000']
       if (!group || key[0] == null || key[0] !== group[0] || key[1] !== group[1]) {
@@ -101,7 +95,8 @@ export function buildPdf(mupdf, objects) {
         group = key
         ops.push(`q ${rgb(key[1])} RG ${f(STROKE_WIDTH_PT)} w`)
       }
-      moveIfGap(X(o.x1), Y(o.y1))
+      const start = [X(o.x1), Y(o.y1)]
+      if (!last || last[0] !== start[0] || last[1] !== start[1]) ops.push(`${start[0]} ${start[1]} m`)
       if (o.type === 'l') {
         last = [X(o.x2), Y(o.y2)]
         ops.push(`${last[0]} ${last[1]} l`)
@@ -113,10 +108,6 @@ export function buildPdf(mupdf, objects) {
   }
   flush()
 
-  const resources = imgN ? { XObject: xobjects } : {}
-  const page = doc.addPage([0, 0, W, H], 0, resources, ops.join('\n'))
-  doc.insertPage(-1, page)
-  const out = doc.saveToBuffer('compress,garbage').asUint8Array().slice()
-  doc.destroy?.()
-  return out
+  page.node.addContentStream(doc.context.register(doc.context.flateStream(ops.join('\n'))))
+  return doc.save()
 }

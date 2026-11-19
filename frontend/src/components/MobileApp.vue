@@ -13,7 +13,7 @@
 
     <!-- Header -->
     <header class="m-header">
-      <img class="m-logo" src="/logo.svg" alt="ChronoCut" />
+      <img class="m-logo" :src="`${BASE}logo.svg`" alt="ChronoCut" />
       <div class="m-titles">
         <h1 class="m-title">ChronoCut</h1>
         <p class="m-tagline">{{ t('mobileTagline') }}</p>
@@ -120,6 +120,8 @@
 
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
+// public/ files: relative to where the app is served (may be a sub folder)
+const BASE = import.meta.env.BASE_URL
 import { ensureImageInk, getImageInk } from '../imageInk'
 import { loadProfiles, speedsFor, hasThicknessChoice, familyDetail } from '../profiles'
 import { buildToolpath, fixColors, removeWhite, computeDoubleRemoval, PATH_ORDER_ALGORITHMS } from '../toolpath'
@@ -246,7 +248,7 @@ const uploadFile = async (file) => {
   isLoading.value = true
   flash.value = ''
   try {
-    // Read locally (MuPDF in a web worker) - nothing is uploaded.
+    // Read locally (pdf.js in a web worker) - nothing is uploaded.
     const result = await extractFile(file)
     if (result.warnings?.includes('svgText')) alert(t('svgTextWarning'))
     data.value = result.lines
@@ -302,7 +304,7 @@ const handleDownload = async () => {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 onMounted(async () => {
-  warmUp()   // start loading MuPDF now, so the first file opens quickly
+  warmUp()   // start the PDF worker now, so the first file opens quickly
   const { printers } = await loadProfiles()
   cutters.value = printers
   if (cutters.value.length) onCutter(cutters.value[0])

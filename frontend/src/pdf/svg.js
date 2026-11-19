@@ -1,12 +1,6 @@
-// Minimal SVG reader: turns an SVG document into paint operations (filled and
-// stroked paths, images) in PDF points, origin top-left - the same space the
-// MuPDF device callbacks deliver for a PDF page.
-//
-// Why our own: the WebAssembly build of MuPDF (mupdf.js) ships without the SVG
-// document handler. It is used for two things:
-//   1. reading back MuPDF's own SVG output (PDF page -> SVG with text as paths),
-//      which is how text becomes outlines - same trick as the old backend;
-//   2. reading SVG files the user loads directly.
+// Minimal SVG reader: turns an SVG file the user loads into paint operations
+// (filled and stroked paths, images, text) in PDF points, origin top-left -
+// the same space the PDF extraction works in (extract.js).
 //
 // Supported: svg/g/use/symbol/defs, path (all commands incl. arcs), rect (also
 // rounded), circle, ellipse, line, polyline, polygon, image; transforms;
@@ -14,7 +8,7 @@
 // (tag, .class, #id, tag.class, comma lists - enough for CorelDRAW/Inkscape/
 // Illustrator exports); inheritance; display:none / visibility:hidden.
 // <text>/<tspan> come out as 'text' ops (positions, font, colour); the caller
-// sets them with MuPDF's built-in fonts and converts them to outlines.
+// sets them with the PDF standard fonts and converts them to outlines.
 // Not supported: gradients and patterns as paint (skipped), clipping, masks,
 // opacity, text on a path.
 
@@ -30,9 +24,9 @@ const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[
 const NUM_RE = /[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g
 const nums = (s) => (String(s || '').match(NUM_RE) || []).map(Number)
 
-// User units per unit. MuPDF's SVG reader counts 1 px = 1 pt (72 per inch),
-// unlike browsers (96). Kept like that on purpose: the old backend read SVGs
-// with MuPDF, so files keep exactly the size they had before.
+// User units per unit. 1 px = 1 pt (72 per inch), unlike browsers (96): the
+// earlier versions read SVGs with MuPDF, which counts that way, so files keep
+// exactly the size they always had in ChronoCut.
 const UNIT_PX = { '': 1, px: 1, pt: 1, pc: 12, mm: 72 / 25.4, cm: 72 / 2.54, in: 72 }
 function length(v, ref = 0) {
   if (v == null || v === '') return null

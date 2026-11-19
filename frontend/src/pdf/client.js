@@ -1,5 +1,5 @@
-// UI side of the PDF worker. Replaces the former backend endpoints
-// /api/pdf_extraction and /api/save_pdf - everything runs locally.
+// UI side of the PDF worker (pdfWorker.js): reading PDF/SVG files and writing
+// PDFs, all locally in the browser.
 let worker = null
 let seq = 0
 const pending = new Map()
@@ -29,13 +29,14 @@ function call(msg, transfer = []) {
   return new Promise((resolve, reject) => {
     const id = ++seq
     pending.set(id, { resolve, reject })
-    getWorker().postMessage({ ...msg, id }, transfer)
+    // base: where the app lives, so the worker finds pdfjs/ (fonts, decoders)
+    getWorker().postMessage({ ...msg, id, base: new URL('./', document.baseURI).href }, transfer)
   })
 }
 
-// Start loading MuPDF early (it is ~10 MB, cached by the browser afterwards).
+// Start the PDF worker early, so the first file opens without waiting for it.
 export function warmUp() {
-  try { getWorker() } catch { /* ignore - the first real call reports it */ }
+  call({ op: 'ping' }).catch(() => { /* the first real call reports it */ })
 }
 
 /** File (PDF/SVG) -> { success, lines, line_count, warnings } */

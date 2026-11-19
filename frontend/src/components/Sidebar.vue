@@ -438,7 +438,7 @@ const handleUpload = () => {
 const uploadFile = async (file) => {
   isLoading.value = true
   try {
-    // Read locally (MuPDF in a web worker) - nothing is uploaded.
+    // Read locally (pdf.js in a web worker) - nothing is uploaded.
     const result = await extractFile(file)
     if (result.warnings?.includes('svgText')) alert(t('svgTextWarning'))
     eventBus.emit('lines-updated', result.lines)
@@ -581,7 +581,7 @@ const resetEdits = () => {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 onMounted(async () => {
-  warmUp()   // start loading MuPDF now, so the first file opens quickly
+  warmUp()   // start the PDF worker now, so the first file opens quickly
 
   // pointerdown (capture) so the dropdowns close on ANY press outside them,
   // sidebar, preview canvas, etc., regardless of stopPropagation downstream.

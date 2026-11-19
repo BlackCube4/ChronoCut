@@ -899,8 +899,10 @@ const loadHeadIcon = (group) => {
     for (const c of [...group.children]) { group.remove(c); c.geometry?.dispose?.(); c.material?.dispose?.() }
     group.add(sprite)
   }
-  loader.load('/printhead.svg', swap, undefined,
-    () => loader.load('/printhead.png', swap, undefined, () => {}))
+  // BASE_URL, not '/': the app may be served from a sub folder
+  const base = import.meta.env.BASE_URL
+  loader.load(`${base}printhead.svg`, swap, undefined,
+    () => loader.load(`${base}printhead.png`, swap, undefined, () => {}))
 }
 
 // Distance travelled after time `tl` into a run of length S that starts at rest
@@ -1431,7 +1433,7 @@ async function handleDownloadRequest() {
   if (!currentData) return
   try {
     // The CURRENT (edited) drawing, so every edit tool is reflected - rebuilt
-    // as a PDF locally (MuPDF in a web worker).
+    // as a PDF locally (pdf-lib in a web worker).
     await downloadPdf(currentData)
   } catch (e) {
     console.error('Error saving PDF:', e)
