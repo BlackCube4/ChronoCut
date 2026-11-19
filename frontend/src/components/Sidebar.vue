@@ -198,7 +198,16 @@
           <path d="M5 19 L15 9" /><path d="M14 4 l1 2.5 L17.5 7.5 L15 8.5 L14 11 L13 8.5 L10.5 7.5 L13 6.5 Z" />
           <path d="M19 13 l.6 1.4 L21 15 l-1.4 .6 L19 17 l-.6-1.4 L17 15 l1.4-.6 Z" />
         </svg>
-        <span class="btn-text">{{ autopilot.flash || t('autopilot') }}</span>
+        <!-- Same trick as the edit buttons below: the button is as big as its
+             longest result text, and a shorter one sits vertically centred. -->
+        <span class="btn-stack">
+          <span v-for="g in autopilotGhosts" :key="g" class="btn-text ghost" aria-hidden="true">{{ g }}</span>
+          <span class="btn-text">{{ autopilot.flash || t('autopilot') }}</span>
+        </span>
+        <span class="btn-badge-slot">
+          <span v-if="autopilot.badge" class="btn-badge"
+                :class="autopilot.badge === '✓' ? 'badge-ok' : 'badge-done'">{{ autopilot.badge }}</span>
+        </span>
       </button>
       <button
         v-for="a in EDIT_ACTIONS"
@@ -209,15 +218,28 @@
         :title="t(EDIT_TIP[a])"
         @click="onEditClick(a)"
       >
-        <span v-if="editState[a].busy" class="btn-spinner"></span>
-        <span class="btn-text">{{ editLabel(a) }}</span>
+        <!-- Every state's text sits in the same grid cell as an invisible,
+             always-bold placeholder, with the current text on top. The button
+             is therefore always as big as its longest state (in bold, like the
+             armed state) and never grows or shrinks while you click through. -->
+        <span class="btn-stack">
+          <span v-for="k in LABEL_KINDS" :key="k" class="btn-text ghost"
+                aria-hidden="true">{{ t(EDIT_CFG[a][k]) }}</span>
+          <span class="btn-text">{{ t(EDIT_CFG[a][labelKind(a)]) }}</span>
+        </span>
+        <!-- Fixed slot on the right: spinner while working, the count when
+             armed or done, empty otherwise - always the same width. -->
+        <span class="btn-badge-slot">
+          <span v-if="editState[a].busy" class="btn-spinner"></span>
+          <span v-else-if="badgeText(a)" class="btn-badge" :class="badgeKind(a)">{{ badgeText(a) }}</span>
+        </span>
       </button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import eventBus from '../eventBus'
 import { loadProfiles, speedsFor, applyCustomProfile, hasThicknessChoice, familyDetail } from '../profiles'
 import { PATH_ORDER_ALGORITHMS } from '../toolpath'
@@ -226,7 +248,7 @@ import {
   DPI_PRESETS, DEFAULT_DPI, DEFAULT_CUSTOM_PROFILE,
   getStoredCustomProfile, setStoredCustomProfile, dpiForPreset, customSpeedsForPreset,
 } from '../customProfile'
-import { t } from '../translations'
+import { t, locale } from '../translations'
 import ProfileDropdown from './ProfileDropdown.vue'
 
 import { extractFile, warmUp } from '../pdf/client.js'
@@ -476,14 +498,13 @@ const EDIT_CFG = {
   tinysegs:   { idle: 'removeTinySegs',   armed: 'tinySegsArmedN',    none: 'tinySegsNone',     done: 'tinySegsDone' },
   joincurves: { idle: 'joinCurves',       armed: 'joinCurvesArmedN',  none: 'joinCurvesNone',   done: 'joinCurvesDone' },
 }
-const editState = reactive({
-  doubles:    { armed: false, busy: false, count: 0, flash: '' },
-  colors:     { armed: false, busy: false, count: 0, flash: '' },
-  white:      { armed: false, busy: false, count: 0, flash: '' },
-  watermarks: { armed: false, busy: false, count: 0, flash: '' },
-  tinysegs:   { armed: false, busy: false, count: 0, flash: '' },
-  joincurves: { armed: false, busy: false, count: 0, flash: '' },
-})
+// flash = '' | 'done' | 'none'. Both stay until the button is used again or
+// another file is loaded: 'none' ("X analysiert") with a green tick right
+// away, 'done' ("X entfernt") first with its number (count, or time saved),
+// which turns into the green tick after a few seconds.
+const blankEdit = () => ({ armed: false, busy: false, count: 0, flash: '', badge: '' })
+const editState = reactive(Object.fromEntries(Object.keys(EDIT_CFG).map((a) => [a, blankEdit()])))
+const LABEL_KINDS = ['idle', 'armed', 'done', 'none']
 
 // m:ss (or h:mm:ss) for the "Kurven verbinden" result text.
 const fmtSaved = (sec) => {
@@ -491,11 +512,22 @@ const fmtSaved = (sec) => {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`
 }
 
-const editLabel = (a) => {
-  const s = editState[a], cfg = EDIT_CFG[a]
+const labelKind = (a) => {
+  const s = editState[a]
   if (s.flash) return s.flash
-  if (s.armed) return t(cfg.armed, { n: s.count })
-  return t(cfg.idle)
+  return s.armed ? 'armed' : 'idle'
+}
+const badgeText = (a) => {
+  const s = editState[a]
+  if (s.armed) return String(s.count)
+  if (s.flash === 'done') return s.badge || '✓'
+  if (s.flash === 'none') return '✓'
+  return ''
+}
+const badgeKind = (a) => {
+  const s = editState[a]
+  if (s.armed) return 'badge-armed'
+  return badgeText(a) === '✓' ? 'badge-ok' : 'badge-done'
 }
 
 const anyArmed = () => EDIT_ACTIONS.some((a) => editState[a].armed)
@@ -510,9 +542,12 @@ const cancelArmed = (keep = null) => {
   if (cleared) eventBus.emit('edit-cancel')
 }
 
-const flashEdit = (a, text, ms = 1500) => {
-  editState[a].flash = text
-  setTimeout(() => { editState[a].flash = '' }, ms)
+const flashTimers = {}
+const flashEdit = (a, kind, badge = '', ms = 1500) => {
+  Object.assign(editState[a], { flash: kind, badge })
+  clearTimeout(flashTimers[a])
+  if (kind === 'none') return              // "analysiert ✓" stays
+  flashTimers[a] = setTimeout(() => { editState[a].badge = '✓' }, ms)   // number -> tick, label stays
 }
 
 const onEditClick = (a) => {
@@ -535,19 +570,17 @@ const onEditResult = ({ action, count, phase, paths, saved, autopilot: auto }) =
   // you can read off what each step did.
   const ms = auto ? 5000 : 1500
   if (phase === 'detect') {
-    if (count > 0) { s.armed = true; s.count = count }
-    else { s.armed = false; flashEdit(action, t(cfg.none)) }
+    if (count > 0) { s.armed = true; s.count = count; s.flash = '' }
+    else { s.armed = false; flashEdit(action, 'none') }
   } else if (action === 'joincurves' && count > 0) {
     // Show what it bought: the time saved on the current settings. With
     // "Optimieren" on that is ~0 (the machine already drives through), so then
-    // just the path count - the tooltip explains why.
+    // just the number of paths - the tooltip explains why.
     s.armed = false; s.count = 0
-    flashEdit(action, saved >= 1
-      ? t('joinCurvesDoneSaved', { n: paths, t: fmtSaved(saved) })
-      : t('joinCurvesDone', { n: paths }), 5000)
+    flashEdit(action, 'done', saved >= 1 ? `−${fmtSaved(saved)}` : String(paths), 5000)
   } else {                                // applied
     s.armed = false; s.count = 0
-    flashEdit(action, count > 0 ? t(cfg.done) : t(cfg.none), ms)
+    flashEdit(action, count > 0 ? 'done' : 'none', count > 0 ? String(count) : '', ms)
   }
 }
 
@@ -555,7 +588,10 @@ const onEditResult = ({ action, count, phase, paths, saved, autopilot: auto }) =
 // No detect/confirm step - that's the point of it. The viewer runs all steps on
 // the data in one go (ThreeViewer handleAutopilot) and reports each step as a
 // normal 'edit-result' plus one 'autopilot-result' summary.
-const autopilot = reactive({ busy: false, flash: '' })
+const autopilot = reactive({ busy: false, flash: '', badge: '' })
+let autopilotTimer = null
+// Every text the Autopilot button can show, with wide stand-in numbers.
+const autopilotGhosts = computed(() => [t('autopilot'), t('autopilotDone')])
 
 const onAutopilotClick = () => {
   if (autopilot.busy) return
@@ -564,24 +600,60 @@ const onAutopilotClick = () => {
   setTimeout(() => eventBus.emit('edit-autopilot'), 0)   // defer so the spinner paints first
 }
 
-const onAutopilotResult = ({ changed, total, saved }) => {
+const onAutopilotResult = ({ changed, saved }) => {
+  // "Optimiert" either way - "4 von 7 Schritten" read as if the autopilot had
+  // skipped something. Time saved shows for a while, then the green tick stays.
   autopilot.busy = false
-  autopilot.flash = changed === 0
-    ? t('autopilotNone')
-    : saved >= 1
-      ? t('autopilotDoneSaved', { n: changed, m: total, t: fmtSaved(saved) })
-      : t('autopilotDone', { n: changed, m: total })
-  setTimeout(() => { autopilot.flash = '' }, 5000)
+  autopilot.flash = t('autopilotDone')
+  clearTimeout(autopilotTimer)
+  if (changed > 0 && saved >= 1) {
+    autopilot.badge = `−${fmtSaved(saved)}`
+    autopilotTimer = setTimeout(() => { autopilot.badge = '✓' }, 5000)
+  } else autopilot.badge = '✓'
 }
 
 const resetEdits = () => {
-  for (const a of EDIT_ACTIONS) Object.assign(editState[a], { armed: false, busy: false, count: 0, flash: '' })
-  Object.assign(autopilot, { busy: false, flash: '' })
+  for (const a of EDIT_ACTIONS) { clearTimeout(flashTimers[a]); Object.assign(editState[a], blankEdit()) }
+  clearTimeout(autopilotTimer)
+  Object.assign(autopilot, { busy: false, flash: '', badge: '' })
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
+// ── Default sidebar width ────────────────────────────────────────────────────
+// The width at which every tool button's longest state (in bold, see
+// .btn-stack) fits on ONE line. App.vue uses it as the default width as long
+// as the user has not dragged the sidebar. Measured with the real font, and
+// again when the language changes.
+// Measured in the real page layout (a hidden nowrap span in the button), not
+// with a canvas: with display scaling (e.g. 125 %) the canvas came out a pixel
+// short and the longest label wrapped after all.
+const measureFitWidth = () => {
+  const btn = bottomButtonsRef.value?.querySelector('.sidebar-btn:not(.autopilot-btn)')
+  const aside = btn?.closest('.sidebar')
+  const ghost = btn?.querySelector('.btn-text.ghost')
+  if (!btn || !aside || !ghost) return
+  const probe = ghost.cloneNode(false)        // clone: keeps Vue's scoped-style attribute (bold)
+  Object.assign(probe.style, { position: 'absolute', visibility: 'hidden', whiteSpace: 'nowrap', width: 'auto' })
+  ghost.parentNode.appendChild(probe)   // inside .btn-stack: same bold rule as the ghosts
+  let text = 0
+  for (const a of EDIT_ACTIONS) {
+    for (const k of LABEL_KINDS) {
+      probe.textContent = t(EDIT_CFG[a][k])
+      text = Math.max(text, probe.getBoundingClientRect().width)
+    }
+  }
+  probe.remove()
+  const bs = getComputedStyle(btn)
+  const inner = parseFloat(bs.paddingLeft) + parseFloat(bs.paddingRight) +
+                parseFloat(bs.borderLeftWidth) + parseFloat(bs.borderRightWidth)
+  const around = aside.getBoundingClientRect().width - btn.getBoundingClientRect().width
+  eventBus.emit('sidebar-fit-width', Math.ceil(text + inner + around + 4))   // +4: rounding headroom
+}
+watch(locale, () => nextTick(measureFitWidth))
+
 onMounted(async () => {
   warmUp()   // start the PDF worker now, so the first file opens quickly
+  ;(document.fonts?.ready ?? Promise.resolve()).then(() => nextTick(measureFitWidth))
 
   // pointerdown (capture) so the dropdowns close on ANY press outside them,
   // sidebar, preview canvas, etc., regardless of stopPropagation downstream.
@@ -662,6 +734,9 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  /* Height of the settings button that appears when Custom is switched on -
+     reserved up front so turning it on does not push everything below down. */
+  min-height: 24px;
 }
 
 .custom-switch {
@@ -941,6 +1016,35 @@ onBeforeUnmount(() => {
 }
 .sidebar-btn.armed .btn-text { color: #c800c8; font-weight: 600; }
 .btn-text { flex: 1; text-align: left; color: var(--text-strong); }
+
+/* Edit buttons: all state texts stacked in one cell (see template). */
+.btn-stack { flex: 1; display: grid; min-width: 0; }
+.btn-stack > .btn-text { grid-area: 1 / 1; align-self: center; }   /* one line in a two-line button: centred */
+.btn-stack > .btn-text.ghost { visibility: hidden; font-weight: 600; }   /* bold = widest case */
+/* Spinner and count sit on the button's top-right corner, outside the text
+   flow, so they never take width from the label or move anything. */
+.sidebar-btn { position: relative; }
+.btn-badge-slot {
+  position: absolute;
+  top: -7px;
+  right: -5px;
+  display: flex;
+  pointer-events: none;
+}
+.btn-badge-slot .btn-spinner { background: var(--ctrl-bg); }
+.btn-badge {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 7px;
+  box-shadow: 0 0 0 2px var(--panel-bg);   /* sits on the border: cut it out */
+  border-radius: 999px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.badge-armed { background: #ff00ff; color: #fff; }
+.badge-done { background: var(--active-bg); color: var(--text-strong); }
+.badge-ok { background: #2e9e4f; color: #fff; }
 
 /* Autopilot: the one accent button in the edit group (same teal as the
    download button), set slightly apart from the single steps below it. */

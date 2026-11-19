@@ -98,7 +98,7 @@ import { t } from './translations'
 import { THEME_KEY, getStoredDark } from './theme'
 import {
   SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth,
-  getStoredSidebarWidth, setStoredSidebarWidth,
+  getStoredSidebarWidth, setStoredSidebarWidth, clearStoredSidebarWidth,
 } from './layout'
 
 // Mobile vs. desktop layout. On a narrow viewport we render the plain MobileApp
@@ -146,8 +146,19 @@ const toggleTheme = () => {
 // the width being asked for, no offset bookkeeping needed. Width is applied
 // live (the viewer re-fits itself via its ResizeObserver) and only written to
 // storage when the drag ends, so a drag isn't hundreds of localStorage writes.
-const sidebarWidth = ref(getStoredSidebarWidth())
+//
+// Default width (never dragged, or reset by double-click): the one at which
+// every tool button fits on one line - measured by the sidebar itself and
+// re-measured when the language changes ('sidebar-fit-width').
+const storedWidth = getStoredSidebarWidth()
+let userSized = storedWidth != null
+let fitWidth = null
+const sidebarWidth = ref(storedWidth ?? SIDEBAR_DEFAULT_WIDTH)
 const resizingSidebar = ref(false)
+const onSidebarFitWidth = (px) => {
+  fitWidth = clampSidebarWidth(px)
+  if (!userSized) sidebarWidth.value = fitWidth
+}
 
 const onSidebarResizeMove = (e) => { sidebarWidth.value = clampSidebarWidth(e.clientX) }
 
@@ -157,6 +168,7 @@ const endSidebarResize = () => {
   window.removeEventListener('pointermove', onSidebarResizeMove)
   window.removeEventListener('pointerup', endSidebarResize)
   window.removeEventListener('pointercancel', endSidebarResize)
+  userSized = true
   setStoredSidebarWidth(sidebarWidth.value)
 }
 
@@ -169,13 +181,15 @@ const startSidebarResize = (e) => {
 }
 
 const resetSidebarWidth = () => {
-  sidebarWidth.value = SIDEBAR_DEFAULT_WIDTH
-  setStoredSidebarWidth(sidebarWidth.value)
+  userSized = false
+  clearStoredSidebarWidth()
+  sidebarWidth.value = fitWidth ?? SIDEBAR_DEFAULT_WIDTH
 }
 
 onMounted(() => {
   mobileMq.addEventListener('change', onMqChange)
   eventBus.on('lines-updated', onLinesUpdated)
+  eventBus.on('sidebar-fit-width', onSidebarFitWidth)
   eventBus.on('toolpath-stats', onStats)
   eventBus.on('debug-colors-changed', onDebugToggled)
   eventBus.on('speed-gradient-changed', onGradientToggled)
@@ -188,6 +202,7 @@ onBeforeUnmount(() => {
   endSidebarResize()   // drops any listeners still attached mid-drag
   mobileMq.removeEventListener('change', onMqChange)
   eventBus.off('lines-updated', onLinesUpdated)
+  eventBus.off('sidebar-fit-width', onSidebarFitWidth)
   eventBus.off('toolpath-stats', onStats)
   eventBus.off('debug-colors-changed', onDebugToggled)
   eventBus.off('speed-gradient-changed', onGradientToggled)

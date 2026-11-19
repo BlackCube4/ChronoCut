@@ -6,9 +6,12 @@
 import { PDFDocument } from 'pdf-lib'
 import { MM_PER_PT } from './extract.js'
 
-// Default stroke width for cut/engrave lines (the extraction does not keep the
-// original widths). Thin so the geometry stays faithful.
-const STROKE_WIDTH_PT = 0.5
+// Stroke width for cut/engrave lines (the extraction does not keep the
+// original widths): 0.01 mm, as close to a hairline as is safe. A true PDF
+// hairline (0 w) means "thinnest the device can draw", which some viewers and
+// drivers treat differently; a tiny fixed width is read as a vector line by
+// the laser driver everywhere (the calibration files use 0.026 mm).
+const STROKE_WIDTH_PT = 0.01 / MM_PER_PT
 
 const f = (v) => {
   const s = (Math.round(v * 10000) / 10000).toString()
