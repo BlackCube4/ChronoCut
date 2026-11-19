@@ -461,52 +461,105 @@ function subtractIv(A, B) {            // A minus B (both merged)
 }
 
 // ── Grouping of collinear straight segments ───────────────────────────────────
-// Spatial hash on (angle, perpendicular offset). Membership is decided against
-// the group's representative, which bounds a group's spread to the tolerance.
+// Membership is decided against the group's representative, which bounds a
+// group's spread to the tolerance.
+//
+// Candidates come from a grid of GROUP_CELL mm cells: every member registers
+// itself in the cells it passes through. A group is joined only if one of its
+// members really OVERLAPS the new piece (on the group's axis) - only overlaps
+// are doubles, and unlike "near enough to show up in a nearby cell" that does
+// not depend on where the cell borders fall, i.e. on where the drawing sits. (The old hash on (angle, offset from the origin) did: one
+// angle bucket further, the offset moved by up to ANGLE_TOL x distance from
+// the origin, i.e. millimetres, and real doubles were missed or found
+// depending on the position. Moving the drawing turned up new ones.)
 const angDist = (a, b) => { const d = Math.abs(a - b); return Math.min(d, Math.PI - d) }
+const GROUP_CELL = 2   // mm, >= 2 * C_TOL so a 3x3 neighbourhood always reaches
 
 function groupCollinear(segs) {
   const groups = []
-  const index = new Map()                       // bucket -> group indices
-  for (const s of segs) {
+  const parent = []                             // merged groups point to the survivor
+  const find = (i) => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i }
+  const cells = new Map()                       // cell -> items registered there
+  const cOf = (ang, x, y) => -Math.sin(ang) * x + Math.cos(ang) * y
+  const cellsOf = (s) => {                      // cells along the segment, both ends included
+    const n = Math.max(1, Math.ceil(Math.hypot(s.x2 - s.x1, s.y2 - s.y1) / GROUP_CELL))
+    const out = new Set()
+    for (let i = 0; i <= n; i++) {
+      const f = i / n
+      out.add(`${Math.floor((s.x1 + (s.x2 - s.x1) * f) / GROUP_CELL)}|${Math.floor((s.y1 + (s.y2 - s.y1) * f) / GROUP_CELL)}`)
+    }
+    return out
+  }
+  // 1e-9 slack: 3-decimal PDF coordinates hit the tolerance exactly, and float
+  // noise must not decide those differently after the drawing moved.
+  const fits = (g, a, x, y) => angDist(a, g.a) <= ANGLE_TOL + 1e-9 && Math.abs(cOf(g.a, x, y) - g.c) <= C_TOL + 1e-7
+  const project = (g, it) => {
+    const t1 = g.ux * it.s.x1 + g.uy * it.s.y1
+    const t2 = g.ux * it.s.x2 + g.uy * it.s.y2
+    it.lo = Math.min(t1, t2); it.hi = Math.max(t1, t2); it.flip = t2 < t1
+    return it
+  }
+
+  segs.forEach((s, seq) => {
     let a = Math.atan2(s.y2 - s.y1, s.x2 - s.x1)
     if (a < 0) a += Math.PI
     if (a >= Math.PI) a -= Math.PI
     const mx = (s.x1 + s.x2) / 2, my = (s.y1 + s.y2) / 2
-    // Bucket with a canonical (group-independent) normal so the hash is stable.
-    const ka = Math.round(a / ANGLE_TOL)
-    const ca = ka * ANGLE_TOL
-    const cOf = (ang, x, y) => -Math.sin(ang) * x + Math.cos(ang) * y
-    const kc = Math.round(cOf(ca, mx, my) / C_TOL)
+    const own = cellsOf(s)
 
-    let g = null
-    outer:
-    for (let da = -1; da <= 1 && !g; da++) {
-      for (let dc = -1; dc <= 1; dc++) {
-        const list = index.get(`${ka + da}|${kc + dc}`)
-        if (!list) continue
-        for (const gi of list) {
-          const cand = groups[gi]
-          if (angDist(a, cand.a) > ANGLE_TOL) continue
-          if (Math.abs(cOf(cand.a, mx, my) - cand.c) > C_TOL) continue
-          g = cand
-          break outer
+    const seen = new Set(), ok = new Map()      // item / group (-> fits?) already looked at
+    const hitSet = new Set()
+    for (const key of own) {
+      const [cx, cy] = key.split('|').map(Number)
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const list = cells.get(`${cx + dx}|${cy + dy}`)
+          if (!list) continue
+          for (const it of list) {
+            if (seen.has(it)) continue
+            seen.add(it)
+            const gi = find(it.g)
+            if (hitSet.has(gi)) continue
+            const g = groups[gi]
+            if (!ok.has(gi)) ok.set(gi, fits(g, a, mx, my))
+            if (!ok.get(gi)) continue
+            const t1 = g.ux * s.x1 + g.uy * s.y1, t2 = g.ux * s.x2 + g.uy * s.y2
+            if (Math.min(Math.max(t1, t2), it.hi) - Math.max(Math.min(t1, t2), it.lo) > OVERLAP_EPS) hitSet.add(gi)
+          }
         }
       }
     }
-    if (!g) {
-      g = { a, c: cOf(a, mx, my), ux: Math.cos(a), uy: Math.sin(a), items: [] }
-      groups.push(g)
-      const key = `${ka}|${kc}`
-      if (!index.has(key)) index.set(key, [])
-      index.get(key).push(groups.length - 1)
+    const hits = [...hitSet].sort((p, q) => p - q)
+
+    let gi
+    if (hits.length === 0) {
+      gi = groups.length
+      groups.push({ a, c: cOf(a, mx, my), px: mx, py: my, ux: Math.cos(a), uy: Math.sin(a), items: [] })
+      parent.push(gi)
+    } else {
+      // Lowest (= oldest) group wins. A piece bridging two groups merges them,
+      // but only when their representatives agree within the tolerance, so a
+      // chain of merges cannot drift away from the survivor's line.
+      gi = hits[0]
+      const g = groups[gi]
+      for (const other of hits.slice(1)) {
+        const o = groups[other]
+        if (!fits(g, o.a, o.px, o.py)) continue
+        for (const it of o.items) g.items.push(project(g, it))
+        o.items = null
+        parent[other] = gi
+      }
     }
     // Project onto the group's axis; keep the ORIGINAL endpoints for emitting.
-    const t1 = g.ux * s.x1 + g.uy * s.y1
-    const t2 = g.ux * s.x2 + g.uy * s.y2
-    g.items.push({ s, lo: Math.min(t1, t2), hi: Math.max(t1, t2), flip: t2 < t1 })
-  }
-  return groups
+    const item = project(groups[gi], { s, seq, g: gi })
+    groups[gi].items.push(item)
+    for (const key of own) {
+      if (!cells.has(key)) cells.set(key, [])
+      cells.get(key).push(item)
+    }
+  })
+  // Inside a group, file order decides who keeps a shared stretch.
+  return groups.filter((g) => g.items).map((g) => { g.items.sort((p, q) => p.seq - q.seq); return g })
 }
 
 // ── Bezier helpers ────────────────────────────────────────────────────────────
@@ -674,11 +727,38 @@ function curveToSegs(p, sink) {
 
 /**
  * Remove doubled / overlapping coverage. See header above.
+ *
+ * Runs until nothing changes any more: cutting an overlap out of a line leaves
+ * remainders, and those can themselves lie on top of a third line - one pass
+ * used to leave them for a second click (e.g. 405, then 4 more on a production file).
  * @returns {{ data: Array, removed: Array<{x1,y1,x2,y2}> }}
  */
+const DOUBLES_MAX_PASSES = 8
 export function computeDoubleRemoval(data) {
-  const out = []        // survivors, in the input's order where possible
+  let cur = data
+  const removed = []
+  for (let pass = 0; pass < DOUBLES_MAX_PASSES; pass++) {
+    const r = doubleRemovalPass(cur)
+    if (!r.removed.length) break
+    removed.push(...r.removed)
+    cur = r.data
+  }
+  return { data: removed.length ? cur : data, removed }
+}
+
+function doubleRemovalPass(data) {
+  // Survivors go back to the position of the object they came from, so the
+  // file order stays as it was. (They used to come out sorted by collinear
+  // group: after the Autopilot's second doubles pass the pieces of one joined
+  // path were scattered, and the PDF export wrote every stretch as its own path.)
+  const slots = new Map()   // original object -> its surviving pieces
+  const put = (o, piece) => { if (!slots.has(o)) slots.set(o, []); slots.get(o).push(piece) }
+  const dropped = new Set()
   const removed = []    // dropped pieces, as segments for the highlight
+  // Cut points land on the extraction's 0.001 mm grid (pdf/extract.js), so a
+  // trimmed piece is the same here as after saving and re-loading the PDF -
+  // otherwise a gap of 0.01006 mm stays open now and closes after re-loading.
+  const r3 = (v) => Math.round(v * 1000) / 1000
 
   // Blue is processed before red so red always loses against a cut; within one
   // colour the first occurrence in the file wins.
@@ -687,12 +767,10 @@ export function computeDoubleRemoval(data) {
   for (const o of data) {
     const cat = (o.type === 'l' || o.type === 'c') ? categorize(o.color || '#000000') : null
     if (o.type === 'l' && (cat === 'red' || cat === 'blue')) {
-      if (Math.hypot(o.x2 - o.x1, o.y2 - o.y1) < 1e-9) continue     // zero length → drop
+      if (Math.hypot(o.x2 - o.x1, o.y2 - o.y1) < 1e-9) { dropped.add(o); continue }   // zero length → drop
       lines.push(o)
     } else if (o.type === 'c' && (cat === 'red' || cat === 'blue')) {
       curves.push(o)
-    } else {
-      out.push(o)                                                    // untouched
     }
   }
   lines.sort((a, b) => rank(a) - rank(b))
@@ -717,12 +795,12 @@ export function computeDoubleRemoval(data) {
         for (const [t0, t1] of ivs) {
           if (t1 - t0 <= OVERLAP_EPS) continue
           const p = at(t0), q = at(t1)
-          if (sink === 'out') out.push({ ...o, x1: p.x, y1: p.y, x2: q.x, y2: q.y })
+          if (sink === 'out') put(o, { ...o, x1: r3(p.x), y1: r3(p.y), x2: r3(q.x), y2: r3(q.y) })
           else removed.push({ x1: p.x, y1: p.y, x2: q.x, y2: q.y })
         }
       }
       if (keep.length === 1 && keep[0][0] === it.lo && keep[0][1] === it.hi) {
-        out.push(o)                                    // untouched → byte-identical
+        put(o, o)                                      // untouched → byte-identical
       } else {
         emit(keep, 'out')
         emit(subtractIv([[it.lo, it.hi]], keep), 'removed')
@@ -744,7 +822,7 @@ export function computeDoubleRemoval(data) {
     }
     const full = ranges.length === 1 && ranges[0][0] <= 1e-9 && ranges[0][1] >= 1 - 1e-9
     if (full) {
-      out.push(o)
+      put(o, o)
       kept.push({ cp, bbox: bb })
       continue
     }
@@ -754,12 +832,18 @@ export function computeDoubleRemoval(data) {
       if (!sub) continue
       const len = Math.hypot(sub[3].x - sub[0].x, sub[3].y - sub[0].y)
       if (len <= OVERLAP_EPS) continue
-      out.push({ ...o, x1: sub[0].x, y1: sub[0].y, x2: sub[1].x, y2: sub[1].y,
-                       x3: sub[2].x, y3: sub[2].y, x4: sub[3].x, y4: sub[3].y })
+      put(o, { ...o, x1: r3(sub[0].x), y1: r3(sub[0].y), x2: r3(sub[1].x), y2: r3(sub[1].y),
+                     x3: r3(sub[2].x), y3: r3(sub[2].y), x4: r3(sub[3].x), y4: r3(sub[3].y) })
       kept.push({ cp: sub, bbox: bboxOf(sub) })
     }
   }
 
+  const cand = new Set([...lines, ...curves])
+  const out = []
+  for (const o of data) {
+    if (cand.has(o)) { const p = slots.get(o); if (p) out.push(...p) }
+    else if (!dropped.has(o)) out.push(o)
+  }
   return {
     data: out,
     removed: removed.filter(s => Math.hypot(s.x2 - s.x1, s.y2 - s.y1) > OVERLAP_EPS),
@@ -947,6 +1031,7 @@ const JOIN_SMOOTH_COS = Math.cos((JOIN_SMOOTH_DEG * Math.PI) / 180)
 
 let joinPidCounter = 0
 const nextJoinPid = () => `j${++joinPidCounter}`   // the extraction uses numeric pids, no collision
+const isJoinPid = (pid) => typeof pid === 'string' && pid[0] === 'j'
 
 // Index ranges [start, end) of prims that should become one fitted curve run.
 function smoothRuns(prims) {
@@ -978,12 +1063,27 @@ function joinPlan(data) {
   const items = []
   data.forEach((obj, idx) => {
     const prim = objToPrim(obj)
-    if (prim) items.push({ key: (obj.color || '#000000').toLowerCase(), prim, ref: idx })
+    if (prim) items.push({ key: (obj.color || '#000000').toLowerCase(), prim, ref: idx, group: obj.pid })
   })
+  // Pieces per path this tool made earlier (pid 'j...').
+  const joinedSize = new Map()
+  for (const { ref } of items) {
+    const pid = data[ref].pid
+    if (isJoinPid(pid)) joinedSize.set(pid, (joinedSize.get(pid) || 0) + 1)
+  }
   const plans = []
-  for (const chain of chainPrims(items)) {
+  for (const chain of chainPrims(items, { byGroup: true })) {
     if (chain.prims.length < 2) continue
     const pids = new Set(chain.refs.map((i) => data[i].pid))
+    // Where three pieces meet, the chaining can run through a joined path
+    // instead of along it and take only part of it. Rebuilding that just moves
+    // the split elsewhere (and which way it goes depends on float noise, e.g.
+    // after the drawing moved), so such a chain is not worth anything.
+    const taken = new Map()
+    for (const i of chain.refs) if (isJoinPid(data[i].pid)) taken.set(data[i].pid, (taken.get(data[i].pid) || 0) + 1)
+    let partial = false
+    for (const [pid, n] of taken) if (n < joinedSize.get(pid)) partial = true
+    if (partial) continue
     const runs = smoothRuns(chain.prims)
     const separate = pids.size > 1 || pids.has(undefined)
     if (!separate && runs.length === 0) continue
@@ -993,12 +1093,10 @@ function joinPlan(data) {
 }
 
 export function detectJoinCurves(data) {
-  let count = 0
+  const { consumed } = joinCurvesIter(data)
   const segs = []
-  for (const { chain } of joinPlan(data)) {
-    for (const i of chain.refs) { count++; segs.push(...strokeSegs(data[i])) }
-  }
-  return { count, segs }
+  for (const o of consumed) segs.push(...strokeSegs(o))
+  return { count: consumed.size ? freshCount(consumed) : 0, segs }
 }
 
 const r4 = (v) => Math.round(v * 1e4) / 1e4
@@ -1013,15 +1111,77 @@ function primObj(prim, color, pid) {
 // Returns { data, count, paths }: the new object list (each joined chain sits at
 // the position of its first source object, so drawing order is kept), how many
 // source objects were merged, and into how many paths.
+//
+// Chaining is greedy: where three pieces meet, one of them is left over and
+// only a second pass hangs it onto the now joined path. So this repeats until
+// nothing is left to join; one click (or one autopilot step) does everything.
+const JOIN_MAX_PASSES = 8
 export function joinCurves(data) {
-  const plans = joinPlan(data)
-  if (!plans.length) return { data, count: 0, paths: 0 }
+  const r = joinCurvesIter(data)
+  if (!r.consumed.size) return { data, count: 0, paths: 0 }
+  return { data: r.data, count: freshCount(r.consumed), paths: r.paths }
+}
+
+// Pieces that were not part of a joined path yet - so the Autopilot, which
+// joins again after removing doubles, does not count the same piece twice.
+// Only merging paths that were joined already still reports what it took.
+function freshCount(consumed) {
+  let n = 0
+  for (const o of consumed) if (!isJoinPid(o.pid)) n++
+  return n || consumed.size
+}
+
+// `consumed`: the ORIGINAL objects of `data` that went into a joined path.
+// Pieces made by an earlier pass have new objects, so they are never counted twice.
+function joinCurvesIter(data) {
+  let cur = splitJoinedPaths(data)
+  const original = new Set(cur)
+  const consumed = new Set()
+  const pids = new Set()
+  for (let pass = 0; pass < JOIN_MAX_PASSES; pass++) {
+    const plans = joinPlan(cur)
+    if (!plans.length) break
+    for (const { chain } of plans) for (const i of chain.refs) if (original.has(cur[i])) consumed.add(cur[i])
+    cur = joinPass(cur, plans, pids)
+  }
+  const paths = new Set()
+  for (const o of cur) if (pids.has(o.pid)) paths.add(o.pid)
+  return { data: cur, consumed, paths: paths.size }
+}
+
+// Remove Doubles can cut a joined path into pieces that no longer touch. They
+// still share one pid, so joinPlan would treat every chain through one piece as
+// taking only PART of that path and skip it - after re-loading the export,
+// where the pid is gone, the same chain would be joined. Give each such
+// stretch its own pid first so both cases agree. The input objects are not
+// changed; a renamed piece is a copy.
+function splitJoinedPaths(data) {
+  const last = new Map()      // pid -> { end, pid } of its previous piece
+  let out = null
+  data.forEach((o, i) => {
+    if (!isJoinPid(o.pid) || (o.type !== 'l' && o.type !== 'c')) return
+    const prev = last.get(o.pid)
+    let pid = o.pid
+    if (prev) {
+      const gap = Math.abs(prev.end.x - o.x1) > LINK_MATCH || Math.abs(prev.end.y - o.y1) > LINK_MATCH
+      pid = gap ? nextJoinPid() : prev.pid
+    }
+    last.set(o.pid, { end: o.type === 'l' ? { x: o.x2, y: o.y2 } : { x: o.x4, y: o.y4 }, pid })
+    if (pid !== o.pid) {
+      if (!out) out = data.slice()
+      out[i] = { ...o, pid }
+    }
+  })
+  return out || data
+}
+
+function joinPass(data, plans, pids) {
   const replace = new Map()
   const consumed = new Set()
-  let count = 0
   for (const { chain, runs } of plans) {
     const color = data[chain.seedRef].color
     const pid = nextJoinPid()
+    pids.add(pid)
     const objs = []
     let k = 0
     for (const [rs, re] of runs) {
@@ -1037,22 +1197,42 @@ export function joinCurves(data) {
     // Pieces only had to MEET within LINK_TOL to be chained. Make every start
     // land exactly on the previous end, otherwise the export starts a new
     // subpath (a fresh moveto) at each tiny gap.
-    for (let i = 1; i < objs.length; i++) {
-      const prev = objs[i - 1]
-      objs[i].x1 = prev.type === 'l' ? prev.x2 : prev.x4
-      objs[i].y1 = prev.type === 'l' ? prev.y2 : prev.y4
+    const snap = () => {
+      for (let i = 1; i < objs.length; i++) {
+        const prev = objs[i - 1]
+        objs[i].x1 = prev.type === 'l' ? prev.x2 : prev.x4
+        objs[i].y1 = prev.type === 'l' ? prev.y2 : prev.y4
+      }
     }
+    // The fit, and the snapping itself, can leave crumbs shorter than Remove
+    // Tiny Segments allows; drop them so that step has nothing new to find.
+    // A dropped last piece hands its end to the one before, so a closed
+    // contour still ends where it began.
+    const dropCrumbs = () => {
+      let dropped = false
+      for (let i = objs.length - 1; i >= 0 && objs.length > 1; i--) {
+        if (strokeLen(objs[i]) >= TINY_SEGMENT_LEN) continue
+        const [gone] = objs.splice(i, 1)
+        dropped = true
+        if (i === objs.length && i > 0) {
+          const prev = objs[i - 1], ex = gone.type === 'l' ? gone.x2 : gone.x4, ey = gone.type === 'l' ? gone.y2 : gone.y4
+          if (prev.type === 'l') { prev.x2 = ex; prev.y2 = ey } else { prev.x4 = ex; prev.y4 = ey }
+        }
+      }
+      return dropped
+    }
+    snap()
+    while (dropCrumbs()) snap()
     let first = Infinity
     for (const i of chain.refs) { consumed.add(i); if (i < first) first = i }
     replace.set(first, objs)
-    count += chain.refs.length
   }
   const out = []
   data.forEach((o, i) => {
     if (replace.has(i)) out.push(...replace.get(i))
     else if (!consumed.has(i)) out.push(o)
   })
-  return { data: out, count, paths: plans.length }
+  return out
 }
 
 // ── Bezier fitting (Schneider, "An Algorithm for Automatically Fitting
@@ -1326,6 +1506,17 @@ function primLength(p) {
 // small-/tiny-part warnings. Order-independent linking fixes that for any
 // edit or extraction order.
 const LINK_TOL = 0.01   // mm - matches the old adjacency tolerance
+// PDF coordinates sit on a 0.001 mm grid, so gaps of EXACTLY LINK_TOL are
+// common. Without a little slack, float noise decides them, differently once
+// the drawing has been moved, and a second click found more to join.
+const LINK_MATCH = LINK_TOL + 1e-7
+// Cells around a bucket, nearest first. Two points LINK_MATCH apart can be two
+// buckets apart when both round at .5; the outer ring catches only that case.
+const LINK_RING = (() => {
+  const inner = [], outer = []
+  for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) (Math.abs(dx) < 2 && Math.abs(dy) < 2 ? inner : outer).push([dx, dy])
+  return [...inner, ...outer]
+})()
 
 // l / c extraction object -> primitive ('L' / 'C'), or null for anything else.
 function objToPrim(obj) {
@@ -1357,9 +1548,16 @@ function reconstructPaths(data) {
 // between items with the same `key`. items: [{ key, prim, ref }]. Returns
 // [{ key, prims, refs, seedRef, start, end }]: prims oriented head to tail,
 // refs = the items' refs in the same order, seedRef = the ref the chain grew from.
-function chainPrims(items) {
+//
+// With `byGroup` (Kurven verbinden), items carry a `group` (their path id) and
+// where several pieces meet, the chain goes on along its own path first, then
+// to the nearest end. Without it the first end found wins, which depends on
+// the bucket order and so on where the drawing sits: two contours touching at
+// one point were merged or not depending on the position, and the autopilot
+// found more to join after it had aligned the drawing.
+function chainPrims(items, { byGroup = false } = {}) {
   const prims = items.map((it) => ({
-    cat: it.key, ref: it.ref, prim: it.prim, start: primStart(it.prim), end: primEnd(it.prim),
+    cat: it.key, ref: it.ref, group: it.group, prim: it.prim, start: primStart(it.prim), end: primEnd(it.prim),
   }))
 
   const n = prims.length
@@ -1378,22 +1576,26 @@ function chainPrims(items) {
   }
   for (let i = 0; i < n; i++) { addEntry(i, 'start'); addEntry(i, 'end') }
 
-  const findMatch = (cat, x, y) => {
+  const findMatch = (cat, x, y, group) => {
     const bx = Math.round(x / LINK_TOL), by = Math.round(y / LINK_TOL)
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        const list = index.get(`${cat}|${bx + dx}|${by + dy}`)
-        if (!list) continue
-        for (const e of list) {
-          if (used[e.idx]) continue
-          const pt = e.which === 'start' ? prims[e.idx].start : prims[e.idx].end
-          if (Math.abs(pt.x - x) < LINK_TOL && Math.abs(pt.y - y) < LINK_TOL) return e
-        }
+    let best = null, bestScore = null
+    for (const [dx, dy] of LINK_RING) {
+      const list = index.get(`${cat}|${bx + dx}|${by + dy}`)
+      if (!list) continue
+      for (const e of list) {
+        if (used[e.idx]) continue
+        const pt = e.which === 'start' ? prims[e.idx].start : prims[e.idx].end
+        if (Math.abs(pt.x - x) > LINK_MATCH || Math.abs(pt.y - y) > LINK_MATCH) continue
+        if (!byGroup) return e
+        const score = [prims[e.idx].group === group ? 0 : 1, Math.hypot(pt.x - x, pt.y - y), e.idx, e.which === 'start' ? 0 : 1]
+        let better = !bestScore
+        for (let k = 0; !better && k < score.length && score[k] <= bestScore[k]; k++) better = score[k] < bestScore[k]
+        if (better) { best = e; bestScore = score }
       }
     }
-    return null
+    return best
   }
-  const closes = (a, b) => Math.abs(a.x - b.x) < LINK_TOL && Math.abs(a.y - b.y) < LINK_TOL
+  const closes = (a, b) => Math.abs(a.x - b.x) <= LINK_MATCH && Math.abs(a.y - b.y) <= LINK_MATCH
 
   const paths = []
   for (let i = 0; i < n; i++) {
@@ -1402,31 +1604,34 @@ function chainPrims(items) {
     const seed = prims[i]
     const chain = [seed.prim]
     const refs = [seed.ref]
+    const chainIdx = [i]
     const cat = seed.cat
     let head = seed.start, tail = seed.end
 
     // Extend forward from the tail (next primitive's start must meet our tail).
     for (;;) {
-      const m = findMatch(cat, tail.x, tail.y)
+      const m = findMatch(cat, tail.x, tail.y, prims[chainIdx[chainIdx.length - 1]].group)
       if (!m) break
       used[m.idx] = true
       let next = prims[m.idx].prim
       if (m.which === 'end') next = reversePrim(next)   // orient so its start == tail
       chain.push(next)
       refs.push(prims[m.idx].ref)
+      chainIdx.push(m.idx)
       tail = primEnd(next)
       if (closes(tail, head)) break                     // loop closed
     }
     // Extend backward from the head (only if not already closed into a loop).
     if (!closes(tail, head)) {
       for (;;) {
-        const m = findMatch(cat, head.x, head.y)
+        const m = findMatch(cat, head.x, head.y, prims[chainIdx[0]].group)
         if (!m) break
         used[m.idx] = true
         let prev = prims[m.idx].prim
         if (m.which === 'start') prev = reversePrim(prev)   // orient so its end == head
         chain.unshift(prev)
         refs.unshift(prims[m.idx].ref)
+        chainIdx.unshift(m.idx)
         head = primStart(prev)
         if (closes(tail, head)) break
       }

@@ -722,9 +722,12 @@ const handleEditApply = ({ action }) => {
 
 // ── Autopilot: all edits in a row, one click ─────────────────────────────────
 // Same order as the sidebar buttons (Sidebar.vue EDIT_ACTIONS explains why).
-// If a watermark came off, the drawing is re-aligned once more at the end: a
-// later step (e.g. Remove White) may have taken away the outermost object.
+// At the end the drawing is ALWAYS aligned 5 mm from the top-left bed corner -
+// not only after a watermark came off: plenty of files sit right on the page
+// edge (e.g. a frame drawn on the sheet border), and a later step (Remove
+// White) may have taken away the outermost object.
 const AUTOPILOT_STEPS = ['watermarks', 'white', 'colors', 'tinysegs', 'doubles', 'joincurves']
+const AUTOPILOT_MAX_ROUNDS = 6
 
 const handleAutopilot = () => {
   if (!currentData) {
@@ -739,14 +742,35 @@ const handleAutopilot = () => {
     data = r.data
     results.push({ action, count: r.count, paths: r.paths })
   }
-  const wmRemoved = results[0].count > 0
-  if (wmRemoved) data = alignTopLeft(data)
+  // Remove Doubles and Join Curves feed each other: joining smooths doubled
+  // arcs into curves that only then show up as doubles, and removing an
+  // overlap can leave two paths meeting end to end. The buttons stay separate
+  // on purpose; only the autopilot goes back and forth until both are done.
+  const doubles = results.find((r) => r.action === 'doubles')
+  const join = results.find((r) => r.action === 'joincurves')
+  for (let round = 0; round < AUTOPILOT_MAX_ROUNDS; round++) {
+    const d = runEdit('doubles', data)
+    data = d.data
+    const j = runEdit('joincurves', data)
+    data = j.data
+    doubles.count += d.count
+    join.count += j.count
+    if (!d.count && !j.count) break
+  }
+  // Paths made in this run that are still there at the end (a later round can
+  // merge an earlier round's paths), not just the last round's.
+  const isJoinPid = (pid) => typeof pid === 'string' && pid[0] === 'j'
+  const oldPaths = new Set(currentData.filter((o) => isJoinPid(o.pid)).map((o) => o.pid))
+  join.paths = new Set(data.filter((o) => isJoinPid(o.pid) && !oldPaths.has(o.pid)).map((o) => o.pid)).size
+  const aligned = alignTopLeft(data)
+  const moved = aligned !== data
+  data = aligned
   currentData = data
-  afterEdit(wmRemoved)
+  afterEdit(results[0].count > 0 || moved)
   for (const r of results) eventBus.emit('edit-result', { ...r, phase: 'applied', autopilot: true })
   eventBus.emit('autopilot-result', {
-    changed: results.filter((r) => r.count > 0).length,
-    total: AUTOPILOT_STEPS.length,
+    changed: results.filter((r) => r.count > 0).length + (moved ? 1 : 0),
+    total: AUTOPILOT_STEPS.length + 1,
     saved: lastStats ? Math.max(0, timeBefore - shownTime()) : 0,
   })
 }
