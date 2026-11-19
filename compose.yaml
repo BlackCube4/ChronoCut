@@ -1,0 +1,8 @@
+# docker compose up -d --build   ->   http://<server>:8080/
+services:
+  chronocut:
+    build: .
+    image: chronocut
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

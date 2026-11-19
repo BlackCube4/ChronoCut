@@ -1,0 +1,12 @@
+# Only frontend/, printers/ and docker/ are needed for the image
+**/node_modules
+frontend/dist
+frontend/.tmp-test
+.git
+backend
+uploads
+docs
+laser time calibration
+Reference
+*.xlsx
+*.pdf

@@ -1,162 +1,124 @@
-# Requirements
+# ChronoCut
 
-- pip 26
-- python 3.14
-- node v26
-- npm 11.*
+Estimates how long a job takes on the Epilog Fusion laser cutters (Edgar,
+George) before it is sent, and cleans up drawings for laser cutting (colours,
+doubles, tiny segments, watermarks, joining curves).
 
-- In VS Code: Python Extension
+**Everything runs in the browser.** PDF and SVG files are read and written on
+the user's own computer (MuPDF compiled to WebAssembly). Nothing is uploaded,
+and there is no server-side code: hosting ChronoCut means serving a folder of
+static files.
 
+## Requirements
 
-# Linux
-## Package Installation
+- [Node.js](https://nodejs.org/) 22 LTS or newer (includes npm). Only needed
+  to build or develop, not to use a hosted copy.
+- A current browser (Chrome, Edge, Firefox, Safari).
 
-In the *backend* directory, run the following commands:
-```sh
-python3 -m venv venv
-```
-```sh
-source venv/bin/activate && pip install -r requirements.txt
-```
+## Windows
 
-Then head into the *frontend* directory and run the following command:
+### Quick start
+
+Double-click `ChronoCut-Start.bat` in the project folder. It installs the
+packages on the first run, starts ChronoCut and opens
+http://localhost:5173/. Close the window "ChronoCut" to stop it.
+
+### Manually
+
+In a terminal in the `frontend` folder:
+
 ```sh
 npm install
-```
-
-## Running the application
-
-In the root directory, add the .vscode folder and create this launch.json file:
-
-```json
-{
-    "version": "0.1.0",
-    "compounds": [
-        {
-            "name": "Run Backend + Frontend",
-            "configurations": [
-                "Run Server (Uvicorn)",
-                "Run Frontend"
-            ]
-        }
-    ],
-    "configurations": [
-        {
-            "name": "Run Server (Uvicorn)",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "uvicorn",
-            "args": [
-                "main:app", "--reload"],
-            "cwd": "${workspaceFolder}/backend",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/backend"
-            },
-            "console": "integratedTerminal"
-        },
-        { 
-            "name": "Run Frontend",
-            "type":"node",
-            "request":"launch",
-            "runtimeExecutable":"npm",
-            "runtimeArgs": ["run", "dev"],
-            "cwd": "${workspaceFolder}/frontend",
-            "console": "integratedTerminal"
-        }
-    ]
-}
-```
-
-Then in the vscode sidebar, run the frontend and backend via the GUI. You can start the frontend and backend seperately or run them together via the "Run Backend + Frontend" Option.
-
-Make sure you are using the right Python Interpreter (The one in the virtual environment from this project). In VS Code, press "Ctrl + Shift + P" and then type "Select Python Interpreter" in the Search Bar. Select the python interpreter located at "venv/bin/python".
-
- The application will then be running on http://localhost:5173/
-    
-# Windows            
-## Package Installation 
-In the *backend* directory, run the following commands:
-
-Create virtual environment:
-```sh
-python -m venv venv
-```
-Activate virtual environment (with powershell):
-```sh
-#for powershell use this
-.\venv\Scripts\Activate.ps1
-#for command prompt this
-venv\Scripts\activate.bat
-```
-Install dependencies:
-```sh
-pip install -r requirements.txt
-```
-
-## Running the application
-In the root directory, add the .vscode folder and create this launch.json file:
-
-```json
-{
-    "version": "0.2.0",
-    "compounds": [
-        {
-            "name": "Run Backend + Frontend",
-            "configurations": [
-                "Run Server (Uvicorn)",
-                "Run Frontend"
-            ]
-        }
-    ],
-    "configurations": [
-        {
-            "name": "Run Server (Uvicorn)",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "uvicorn",
-            "args": [
-                "main:app", "--reload"
-            ],
-            "cwd": "${workspaceFolder}/backend",
-            "python": "${workspaceFolder}/backend/venv/Scripts/python.exe",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/backend"
-            },
-            "console": "integratedTerminal"
-        },
-        { 
-            "name": "Run Frontend",
-            "type": "node",
-            "request": "launch",
-            "runtimeExecutable": "npm",
-            "runtimeArgs": ["run", "dev"],
-            "cwd": "${workspaceFolder}/frontend",
-            "console": "integratedTerminal"
-        }
-    ]
-}
-```
-
-Then in the vscode sidebar, run the frontend and backend via the GUI. You can start the frontend and backend seperately or run them together via the "Run Backend + Frontend" Option. If this fails and you get for example a *"module named uvicorn not found"* error, make sure you are using the right Python Interpreter (The one in the virtual environment from this project). In VS Code, press "Ctrl + Shift + P" and then type "Select Python Interpreter" in the Search Bar. Select the python interpreter located at "venv/Scripts/python.exe".
-
-The application will then be running on http://localhost:5173/
-
-## Running via Terminal (Windows)
-
-If you prefer to run the application components manually via the terminal, open two separate terminal windows from the root directory:
-
-**Terminal 1: Backend**
-```sh
-cd backend
-.\venv\Scripts\activate
-uvicorn main:app --reload
-```
-
-**Terminal 2: Frontend**
-```sh
-cd frontend
 npm run dev
 ```
 
-The application will then be running on http://localhost:5173/
+ChronoCut then runs on http://localhost:5173/.
 
+## Linux
+
+In a terminal in the `frontend` folder:
+
+```sh
+npm install
+npm run dev
+```
+
+ChronoCut then runs on http://localhost:5173/.
+
+## Linux server (Docker)
+
+For running ChronoCut permanently on a server, e.g. for everyone in the
+workshop. The image builds the app and serves it with nginx; it only hands
+out files and never sees a drawing.
+
+```sh
+git clone <repository-url> chronocut
+cd chronocut
+docker compose up -d --build
+```
+
+ChronoCut is then reachable on port 8080: `http://<server>:8080/`.
+
+Without compose:
+
+```sh
+docker build -t chronocut .
+docker run -d --name chronocut -p 8080:8080 --restart unless-stopped chronocut
+```
+
+**Updating** after a `git pull`:
+
+```sh
+docker compose up -d --build
+```
+
+**Notes for the server admin**
+
+- 1 CPU core and 256 MB RAM are plenty; the work happens in the browsers.
+- HTTPS: put it behind the existing reverse proxy (or let the proxy terminate
+  TLS and forward to port 8080). No WebSockets, no upload size limits needed:
+  the app only receives GET requests.
+- The app works from a sub path too (e.g. `https://server/chronocut/`), the
+  build uses relative paths.
+- The PDF engine is a ~10 MB `.wasm` file (~5 MB compressed). Browsers cache
+  it after the first visit. The included nginx config serves it compressed
+  and with long cache times (`docker/nginx.conf`).
+
+### Without Docker
+
+Any web server for static files works (nginx, Apache, IIS):
+
+```sh
+cd frontend
+npm ci
+npm run build
+```
+
+and copy the contents of `frontend/dist/` to the web server. The server must
+send `.wasm` files as `application/wasm` (current nginx and Apache do that by
+default). Opening `dist/index.html` directly from disk does not work: browsers
+only run the PDF engine when the page comes from a web server.
+
+## Adding a printer
+
+Printer profiles (machine specs and material presets) are the XML files in
+`printers/`. They are bundled into the app when it is built, so after adding
+or changing one, rebuild (`npm run build`, or `docker compose up -d --build`).
+`printers/Converter.py` turns a folder of Epilog `*.DAT` presets into such a
+file.
+
+## Project layout
+
+| Folder | Contents |
+|---|---|
+| `frontend/` | The app (Vue 3, Three.js). Time model in `src/toolpath.js` and `src/calibration.js`, PDF reading/writing in `src/pdf/`. |
+| `printers/` | Printer and material profiles (XML) and the preset converter. |
+| `laser time calibration/` | Calibration files, measurement protocol and test files for the tools. |
+| `docker/` | nginx configuration for the container. |
+
+## Licence
+
+ChronoCut uses [MuPDF](https://mupdf.com/) (via the `mupdf` npm package),
+which is licensed under the GNU AGPL v3. Anyone who uses a hosted copy must
+be able to get the source code of that copy, e.g. through a link to this
+repository.
