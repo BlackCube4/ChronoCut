@@ -29,8 +29,8 @@ export const LANGS = [
 const messages = {
   de: {
     // Sidebar
-    upload: 'Hochladen',
-    uploading: 'Lädt hoch…',
+    upload: 'Öffnen',
+    uploading: 'Lädt…',
     selectCutter: 'Schneider wählen',
     selectMaterial: 'Material wählen',
     searchMaterial: 'Material suchen…',
@@ -105,8 +105,9 @@ const messages = {
     cleanAllDone: '{n} bereinigt',
     cleanAllNone: 'Nichts zu bereinigen',
     mobileTagline: 'Laser-Job-Vorschau',
-    noFileHint: 'Lade eine PDF- oder SVG-Datei hoch, um die Zeit zu schätzen.',
-    uploadError: 'Fehler beim Hochladen der Datei: ',
+    noFileHint: 'Öffne eine PDF- oder SVG-Datei, um die Zeit zu schätzen.',
+    uploadError: 'Fehler beim Öffnen der Datei: ',
+    svgTextWarning: 'Die SVG-Datei enthält Text, der nicht als Text gelesen werden kann. Bitte Text vorher in Pfade umwandeln oder als PDF exportieren.',
     // Tooltips
     tipRulers: 'Zeigt Lineale (mm) am oberen und linken Rand des Ansichtsfensters an.',
     tipOptimize: 'Entspricht dem Häkchen "Optimieren" im Epilog Job Manager. An: die Maschine sortiert die Pfade (gemessen: Nearest-Neighbour) und fährt flache Knicke durch. Aus: Dateireihenfolge, und an jedem Stützpunkt einer geraden Linie wird angehalten - bei fein zerlegten Kurven (z. B. aus Archicad) sehr langsam. "2-opt" ist nur zum Vergleich.',
@@ -161,8 +162,8 @@ const messages = {
   },
   en: {
     // Sidebar
-    upload: 'Upload',
-    uploading: 'Uploading…',
+    upload: 'Open',
+    uploading: 'Loading…',
     selectCutter: 'Select Cutter',
     selectMaterial: 'Select Material',
     searchMaterial: 'Search material…',
@@ -237,8 +238,9 @@ const messages = {
     cleanAllDone: '{n} cleaned',
     cleanAllNone: 'Nothing to clean',
     mobileTagline: 'Laser job preview',
-    noFileHint: 'Upload a PDF or SVG file to estimate the time.',
-    uploadError: 'Error uploading file: ',
+    noFileHint: 'Open a PDF or SVG file to estimate the time.',
+    uploadError: 'Error opening file: ',
+    svgTextWarning: 'The SVG file contains text that cannot be read as text. Please convert text to paths first or export as PDF.',
     // Tooltips
     tipRulers: 'Shows rulers (mm) along the top and left edges of the viewport.',
     tipOptimize: 'Matches the "Optimize" checkbox in the Epilog Job Manager. On: the machine sorts the paths (measured: nearest-neighbour) and drives through gentle bends. Off: file order, and the head stops at every vertex of a straight-line path - very slow for finely split curves (e.g. from Archicad). "2-opt" is for comparison only.',

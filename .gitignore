@@ -26,10 +26,9 @@ dist-ssr
 *.sln
 *.sw?
 
-backend/uploads/*
-backend/venv/*
-backend/__pycache__
-backend/api/__pycache__
+# Leftovers of the old Python backend (venv, debug dumps) - safe to delete
+/backend/
+/uploads/
 /Reference
 *.DAT
 *.pyc

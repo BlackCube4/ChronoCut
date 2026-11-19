@@ -132,7 +132,7 @@ import ThemeToggle from './ThemeToggle.vue'
 defineProps({ isDark: { type: Boolean, default: false } })
 defineEmits(['toggle-theme'])
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+import { extractFile, downloadPdf, warmUp } from '../pdf/client.js'
 
 // ── State ──────────────────────────────────────────────────────────────────
 const isLoading = ref(false)
@@ -246,11 +246,9 @@ const uploadFile = async (file) => {
   isLoading.value = true
   flash.value = ''
   try {
-    const formData = new FormData()
-    formData.append('file', file)
-    const res = await fetch(`${API_URL}/api/pdf_extraction`, { method: 'POST', body: formData })
-    if (!res.ok) throw new Error('Upload failed')
-    const result = await res.json()
+    // Read locally (MuPDF in a web worker) - nothing is uploaded.
+    const result = await extractFile(file)
+    if (result.warnings?.includes('svgText')) alert(t('svgTextWarning'))
     data.value = result.lines
     fileName.value = file.name
   } catch (err) {
@@ -292,31 +290,11 @@ const cleanAll = () => {
   }, 0)
 }
 
-// ── Download (current, edited drawing → backend rebuilds the PDF) ─────────────
+// ── Download (current, edited drawing → PDF, built locally) ───────────────────
 const handleDownload = async () => {
   if (!hasData.value) return
   try {
-    const res = await fetch(`${API_URL}/api/save_pdf`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data.value),
-    })
-    if (!res.ok) throw new Error('Failed to save PDF')
-    const blob = await res.blob()
-    const url = window.URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    const cd = res.headers.get('Content-Disposition')
-    let filename = 'laser_drawing.pdf'
-    if (cd) {
-      const m = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
-      if (m?.[1]) filename = m[1].replace(/['"]/g, '')
-    }
-    link.download = filename
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    window.URL.revokeObjectURL(url)
+    await downloadPdf(data.value)
   } catch (e) {
     console.error('Error saving PDF:', e)
   }
@@ -324,6 +302,7 @@ const handleDownload = async () => {
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 onMounted(async () => {
+  warmUp()   // start loading MuPDF now, so the first file opens quickly
   const { printers } = await loadProfiles()
   cutters.value = printers
   if (cutters.value.length) onCutter(cutters.value[0])

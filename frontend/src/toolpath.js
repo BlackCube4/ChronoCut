@@ -869,8 +869,8 @@ export function removeTinySegments(data, minLen = TINY_SEGMENT_LEN) {
 }
 
 // ── Wasserzeichen entfernen ───────────────────────────────────────────────────
-// The extraction only TAGS watermark objects (o.wm, see api_pdf_extraction.py and
-// backend/watermarks.xml) - they stay visible, because the laser would get them
+// The extraction only TAGS watermark objects (o.wm, see pdf/extract.js and
+// pdf/watermarks.js) - they stay visible, because the laser would get them
 // too. Removing them is the user's call. Afterwards the drawing is moved so its
 // top-left corner sits WATERMARK_MARGIN mm from the bed corner again: a removed
 // stamp often was the outermost thing on the page.
@@ -932,7 +932,7 @@ export function removeWatermarks(data, margin = WATERMARK_MARGIN) {
 // separate ~0,2 mm straight pieces. Two separate things happen here:
 //   1. JOIN: same-colour pieces whose endpoints touch become one path (one
 //      shared `pid`), and the PDF export writes each pid as ONE path object
-//      (api_save_pdf.py) instead of one object per piece.
+//      (pdf/export.js) instead of one object per piece.
 //   2. SMOOTH: runs of short, gently bending straight pieces are replaced by
 //      fitted bezier curves that stay within JOIN_FIT_TOL of the original points.
 // Only (2) changes how the machine drives with "Optimieren" off: it stops at

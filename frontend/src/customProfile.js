@@ -23,7 +23,7 @@ import { rasterPctForSpeed } from './calibration'
 export const CUSTOM_PROFILE_KEY = 'chronocut-custom-profile-v2'
 
 // DPI choices offered in the sidebar dropdown (matches the values Epilog's
-// own presets actually use most - see backend/printers/*.xml).
+// own presets actually use most - see printers/*.xml).
 export const DPI_PRESETS = [200, 300, 600, 1200]
 export const DEFAULT_DPI = 600   // fallback when a preset carries no dpi/pitch of its own
 
@@ -88,7 +88,7 @@ export function dpiForPreset(thicknessPreset) {
 // ── Preset -> custom speeds ─────────────────────────────────────────────────
 // The custom fields are percentages of the printer's max speed; a preset op is
 // either already a percentage (unit="%", which every real preset in
-// backend/printers/*.xml uses) or an absolute mm/s value. Converting back:
+// printers/*.xml uses) or an absolute mm/s value. Converting back:
 //
 //   vector  %  = mm/s / printer.maxSpeed * 100
 //   raster  %  = rasterPctForSpeed(mm/s)   - raster runs on its OWN speed

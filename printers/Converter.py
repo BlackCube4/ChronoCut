@@ -3,7 +3,7 @@ DAT -> printer XML / CSV converter.
 
 Reads Epilog Fusion material preset files (*.DAT) and turns a whole presets
 folder into ONE self-contained printer XML in the schema the laser app consumes
-(backend/printers/<id>.xml, loaded via GET /api/printers + frontend profiles.js).
+(printers/<id>.xml, bundled into the app by frontend/src/profiles.js).
 
 Colour channels map to operations the way the rest of the project does:
     blue  -> cut          red -> engrave (vector)        green -> raster

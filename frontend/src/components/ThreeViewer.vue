@@ -40,7 +40,7 @@ import { ensureImageInk, getImageInk, grayImageUrl } from '../imageInk'
 const restoredViewSettings = getStoredViewSettings()
 setTessellationTolerance(TESSELLATION_TOL_BY_KEY[restoredViewSettings.tessellation] ?? TESSELLATION_TOL_BY_KEY.normal)
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+import { downloadPdf } from '../pdf/client.js'
 
 const container = ref(null)
 const canvas    = ref(null)
@@ -59,7 +59,7 @@ let cutterW = 1000
 let cutterH = 700
 
 // Retained so we can rebuild the toolpath when a toggle changes without
-// re-fetching from the backend.
+// reading the file again.
 let currentData = null
 // Defaults below are restored from localStorage (see viewSettings.js) so a
 // reload comes back exactly as left; ViewToggles re-broadcasts the same
@@ -1406,30 +1406,9 @@ const drawObjects = (data, { resetPlayback = false } = {}) => {
 async function handleDownloadRequest() {
   if (!currentData) return
   try {
-    // Send the CURRENT (edited) drawing so Fix Colors / Remove Doubles are
-    // reflected, and the backend can rebuild a faithful PDF of the whole design.
-    const response = await fetch(`${API_URL}/api/save_pdf`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(currentData),
-    })
-    if (!response.ok) throw new Error('Failed to save PDF')
-    const blob = await response.blob()
-    const url  = window.URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href  = url
-
-    const cd = response.headers.get('Content-Disposition')
-    let filename = 'laser_drawing.pdf'
-    if (cd) {
-      const m = cd.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
-      if (m?.[1]) filename = m[1].replace(/['"]/g, '')
-    }
-    link.download = filename
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    window.URL.revokeObjectURL(url)
+    // The CURRENT (edited) drawing, so every edit tool is reflected - rebuilt
+    // as a PDF locally (MuPDF in a web worker).
+    await downloadPdf(currentData)
   } catch (e) {
     console.error('Error saving PDF:', e)
   }

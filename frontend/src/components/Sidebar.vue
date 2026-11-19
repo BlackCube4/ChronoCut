@@ -229,7 +229,7 @@ import {
 import { t } from '../translations'
 import ProfileDropdown from './ProfileDropdown.vue'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+import { extractFile, warmUp } from '../pdf/client.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const isLoading = ref(false)
@@ -438,13 +438,9 @@ const handleUpload = () => {
 const uploadFile = async (file) => {
   isLoading.value = true
   try {
-    const formData = new FormData()
-    formData.append('file', file)
-
-    const response = await fetch(`${API_URL}/api/pdf_extraction`, { method: 'POST', body: formData })
-    if (!response.ok) throw new Error('Upload failed')
-
-    const result = await response.json()
+    // Read locally (MuPDF in a web worker) - nothing is uploaded.
+    const result = await extractFile(file)
+    if (result.warnings?.includes('svgText')) alert(t('svgTextWarning'))
     eventBus.emit('lines-updated', result.lines)
     resetEdits()   // a fresh design clears any armed/flashing edit state
   } catch (error) {
@@ -585,13 +581,7 @@ const resetEdits = () => {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 onMounted(async () => {
-  // const response = await fetch(`${API_URL}`)
-  // if (!response.ok) {
-  //     throw new Error(`Response status: ${response.status}`);
-  //   }
-  // const result = await response.json();
-  
-  // console.log("API response: ", result.message);
+  warmUp()   // start loading MuPDF now, so the first file opens quickly
 
   // pointerdown (capture) so the dropdowns close on ANY press outside them,
   // sidebar, preview canvas, etc., regardless of stopPropagation downstream.

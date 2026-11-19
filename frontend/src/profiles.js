@@ -1,14 +1,15 @@
 import { CALIBRATION, rasterSpeedForPct } from './calibration'
 import { t } from './translations'
 
-// Printer / material profiles loaded at startup from GET /api/printers, which
-// returns the contents of every *.xml in backend/printers/. Each file is
-// self-contained: a root <printer …> with specs + a <materials> block of presets.
+// Printer / material profiles: every *.xml in printers/ (repo root) is bundled
+// into the app at build time. Each file is self-contained: a root <printer …>
+// with specs + a <materials> block of presets. Adding a printer = dropping a
+// file in that folder and rebuilding - no index needed.
 //
-// If the request fails or files are malformed we fall back to the built-in
-// defaults so the app always works.
+// If the files are malformed we fall back to the built-in defaults so the app
+// always works.
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const PRINTER_XML = import.meta.glob('../../printers/*.xml', { query: '?raw', import: 'default', eager: true })
 
 const DEFAULT_PROFILES = {
   printers: [
@@ -81,14 +82,10 @@ function parsePrinter(root) {
   }
 }
 
-// The backend lists every *.xml in backend/printers/ and returns their contents
-// (GET /api/printers). Each is a self-contained printer file (specs + presets),
-// so adding a printer = dropping a file in that folder - no index needed.
+// Sorted by file name.
 export async function loadProfiles() {
   try {
-    const res = await fetch(`${API_URL}/api/printers`)
-    if (!res.ok) throw new Error(`/api/printers → ${res.status}`)
-    const { printers: xmls } = await res.json()
+    const xmls = Object.keys(PRINTER_XML).sort().map((k) => PRINTER_XML[k])
     const printers = []
     for (const xml of (xmls || [])) {
       try {
