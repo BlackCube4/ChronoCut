@@ -93,7 +93,7 @@ def load_meta(existing_xml, default_name):
     hand-tuned bed size / accel / power survive a regenerate."""
     meta = {
         "id": default_name.lower(), "name": default_name, "powerW": "60",
-        "bedWidth": "1000", "bedHeight": "700", "maxSpeed": "255", "accel": "2753",
+        "bedWidth": "1000", "bedHeight": "700", "maxSpeed": "253.6", "accel": "1892",
     }
     if existing_xml and os.path.exists(existing_xml):
         try:

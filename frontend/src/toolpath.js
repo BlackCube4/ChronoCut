@@ -82,42 +82,79 @@ export function rampedTime(L, v, a) {
   return 2 * Math.sqrt(L / a)             // triangle (peak < v)
 }
 
+// Same, but JERK-limited (S-shaped speed curve): the acceleration itself
+// ramps up and down at j mm/s³ instead of jumping to a. Rest to rest over S,
+// target speed v. Closed form, no iteration; with j <= 0 it is rampedTime.
+// NOT used by the app: docs/calib/fit_all.mjs tried it for the real machine
+// (2026-11-20) and every finite jerk fitted worse than none.
+export function sCurveTime(S, v, a, j) {
+  if (!v || v <= 0 || S <= 0) return 0
+  if (!a || a <= 0) return S / v
+  if (!j || j <= 0) return rampedTime(S, v, a)
+  // time to go from rest to speed u: without reaching a, or with a plateau at a
+  const accT = (u) => (u * j < a * a ? 2 * Math.sqrt(u / j) : u / a + a / j)
+  const tv = accT(v), dv = (v * tv) / 2       // the run-up covers v * t / 2 (symmetric curve)
+  if (2 * dv <= S) return 2 * tv + (S - 2 * dv) / v
+  // too short for v: peak speed u where up + down cover exactly S
+  const uj = (a * a) / j
+  const u = uj * accT(uj) >= S
+    ? Math.cbrt((S * S * j) / 4)
+    : (a / 2) * (-a / j + Math.sqrt((a / j) ** 2 + (4 * S) / a))
+  return 2 * accT(u)
+}
+
 // Direction change (between consecutive segments) sharper than this forces the
 // head to a full stop - the velocity profile restarts from rest. Catches raster
 // turnarounds (180°) and the vertical step between scan rows (90°), which is
 // exactly where a real machine decelerates, stops and reverses.
 //
-// MEASURED (see calibration.js): the threshold is ~28°, not 60°. The angle
-// series 45–49 varies ONLY the bend angle at constant length and corner count:
-// 8°/14°/20°/26° all cost 139 s optimised, 32° jumps to 154 s. A 12-sided
-// polygon (30° corners) is charged full corner cost, a 48-gon (7.5°) is not.
-const CORNER_COS = Math.cos((CALIBRATION.cornerAngleDeg * Math.PI) / 180)
+// MEASURED (see calibration.js cornerAngleDeg): the threshold is 30°. The
+// angle series 45–49 varies ONLY the bend angle at constant length and corner
+// count: 8°/14°/20°/26° all cost 139 s optimised, 32° jumps to 154 s; the
+// 12-sided polygon (30° corners) at 100 % shows no stops. Above it, 45°, 90°
+// and 150° cost exactly the same (84-86): a full stop, no partial braking.
+// Read at call time (not frozen at import), so the fit scripts in docs/calib
+// can try other constants on the production code.
+const cornerCos = () => Math.cos((CALIBRATION.cornerAngleDeg * Math.PI) / 180)
 
-// Extra time (s) per full stop, on top of the kinematic v/a ramp. Applied at
-// every interior corner of a run.
-const CORNER_PENALTY = CALIBRATION.cornerPenalty
+// Acceleration of a vector or travel move at head speed v (mm/s). `accel` is
+// the printer profile's value at standstill; the machine's estimate assumes
+// MORE acceleration the faster the speed setting (see calibration.js
+// accelPerSpeed), so a short stroke at 100 % is quicker than at 40 % although
+// neither reaches full speed.
+export const accelAt = (v, accel) => (accel > 0 ? accel + (CALIBRATION.accelPerSpeed || 0) * (v || 0) : 0)
 
 // Raster and vector run on DIFFERENT acceleration regimes: the calibrated raster
 // line overhead already contains the whole turnaround, so raster scan lines are
 // modelled at constant speed (a = 0) to avoid charging the ramp twice.
-export const accelFor = (m, accel) => (m.category === 'raster' ? 0 : accel)
+// buildToolpath stores each move's speed (m.v) and the acceleration law of its
+// mode (m.a0, m.a1: "Optimieren" on or off, calibration.js `optimized`).
+export const accelFor = (m, accel) => {
+  if (m.category === 'raster') return 0
+  if (m.a0 != null) return m.a0 > 0 ? m.a0 + m.a1 * (m.v || 0) : 0
+  return accelAt(m.v, accel)
+}
 
 // Same reasoning for the per-stop penalty: a scan row's turnaround is already
 // paid for by the overscan run-out plus the per-line overhead, so charging
 // CORNER_PENALTY again at each row end (2 per row) would double-count it -
 // worth ~80 s on an 80 mm tall region at 600 dpi.
-export const cornerPenaltyFor = (m) => (m.category === 'raster' ? 0 : CORNER_PENALTY)
+export const cornerPenaltyFor = (m) => (m.category === 'raster' ? 0 : (m.p0 ?? CALIBRATION.cornerPenalty))
 
 // Extra time (s) charged on a move beyond the traversal of its own geometry:
 //   travel - the fixed cost of starting the next vector;
 //   raster - the SPEED-INDEPENDENT part of the per-scan-line overhead plus the
 //            Y feed, once per scan row (m.rows). Both come straight from the
 //            measured table (m.lineOverhead), no longer from a formula.
+//   vector - an object that starts right where the previous one ended (no
+//            travel in between) still costs a full stop (m.joined), see
+//            calibration.js objectStopPenalty.
 export const moveExtraTime = (m) => {
-  if (m.kind === 'travel') return m.home ? 0 : CALIBRATION.vectorStartPenalty   // home leg starts no vector
+  if (m.kind === 'travel') return m.home ? 0 : (m.pv ?? CALIBRATION.vectorStartPenalty)   // home leg starts no vector
   if (m.category === 'raster' && m.rows) {
-    return m.rows * (m.lineOverhead + CALIBRATION.rasterYFeed * m.pitch)
+    return (CALIBRATION.rasterBandOverhead || 0) + m.rows * (m.lineOverhead + CALIBRATION.rasterYFeed * m.pitch)
   }
+  if (m.prims) return m.joined ? CALIBRATION.objectStopPenalty : 0
   return 0
 }
 
@@ -212,7 +249,7 @@ export function forcedStopsFor(m) {
  * @returns {{ durs:number[], speeds:number[], total:number }}
  *   durs[i] / speeds[i] = duration (s) and average speed (mm/s) of segment i.
  */
-export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, forced = null) {
+export function rampSegments(points, v, a, cornerPenalty = CALIBRATION.cornerPenalty, forced = null) {
   const n = points.length - 1
   if (n <= 0) return { durs: [], speeds: [], total: 0 }
   const segs = []
@@ -223,22 +260,25 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, force
     segs.push({ L, ux: L > 1e-9 ? dx / L : 0, uy: L > 1e-9 ? dy / L : 0 })
   }
   // Mark vertices where the head must stop (run boundaries).
+  const cosLim = cornerCos()
   const stop = new Array(n + 1).fill(false)
   stop[0] = true; stop[n] = true
   for (let i = 1; i < n; i++) {
     if (forced && forced[i]) { stop[i] = true; continue }   // see forcedStopsFor
     const a0 = segs[i - 1], a1 = segs[i]
     if (a0.L < 1e-9 || a1.L < 1e-9) { stop[i] = true; continue }
-    if (a0.ux * a1.ux + a0.uy * a1.uy < CORNER_COS) stop[i] = true
+    if (a0.ux * a1.ux + a0.uy * a1.uy < cosLim) stop[i] = true
   }
   const durs = new Array(n).fill(0)
   const speeds = new Array(n).fill(v)
+  const runLens = []                          // length of every run (docs/calib fit scripts)
   let total = 0, runs = 0
   for (let rs = 0; rs < n; ) {
     let re = rs + 1
     while (re < n && !stop[re]) re++          // run = segments [rs, re)
     let S = 0
     for (let k = rs; k < re; k++) S += segs[k].L
+    runLens.push(S)
     let s0 = 0
     for (let k = rs; k < re; k++) {
       const s1 = s0 + segs[k].L
@@ -251,8 +291,8 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, force
     rs = re
     runs++
   }
-  // runs - 1 = full stops INSIDE the polyline (REALITY.vectorPerStop counts them).
-  return { durs, speeds, total, runs }
+  // runs - 1 = full stops INSIDE the polyline; runLens for the fit scripts.
+  return { durs, speeds, total, runs, runLens }
 }
 
 /**
@@ -267,7 +307,7 @@ export function rampSegments(points, v, a, cornerPenalty = CORNER_PENALTY, force
  *   dur         duration (s) of the segment under the acceleration profile
  *   runStartRel time (s) at the run's start, relative to the polyline start
  */
-export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY, forced = null) {
+export function annotateRuns(points, v, a, cornerPenalty = CALIBRATION.cornerPenalty, forced = null) {
   const n = points.length - 1
   const out = []
   if (n <= 0) return out
@@ -277,6 +317,7 @@ export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY, force
     segL.push(Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y))
   }
   // Corner stops (same rule as rampSegments): the head rests at run boundaries.
+  const cosLim = cornerCos()
   const stop = new Array(points.length).fill(false)
   stop[0] = true; stop[n] = true
   for (let i = 1; i < n; i++) {
@@ -285,7 +326,7 @@ export function annotateRuns(points, v, a, cornerPenalty = CORNER_PENALTY, force
     const bx = points[i + 1].x - points[i].x, by = points[i + 1].y - points[i].y
     const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by)
     if (la < 1e-9 || lb < 1e-9) { stop[i] = true; continue }
-    if ((ax * bx + ay * by) / (la * lb) < CORNER_COS) stop[i] = true
+    if ((ax * bx + ay * by) / (la * lb) < cosLim) stop[i] = true
   }
 
   let cumTime = 0   // relative to the polyline start
@@ -1531,6 +1572,40 @@ function objToPrim(obj) {
   return null
 }
 
+// The machine drives the file's path OBJECTS (pid), each split only where the
+// path has a gap. Objects without a pid count one primitive each.
+//
+//   "Optimieren" off: in file order. An object that starts where the last one
+//     ended needs no travel but costs a stop of its own (objectStopPenalty).
+//     MEASURED, 89_k_explodiert (the 800 lines of 85 as separate objects):
+//     16 s more than 85 at every speed.
+//   "Optimieren" on: nearest START next - objects are never reversed - and
+//     where it starts exactly at the previous end the head drives through as
+//     if it were one path. 89 then costs exactly what 85 costs, and the two
+//     production files A and B (8482 single lines from CorelDraw, and the same
+//     joined into paths) land on 516 / 447 s like the Job Manager. Merging
+//     every touching piece regardless of direction (what this code did
+//     before) gave 398 s for both; a stop at every object 591 s.
+function reconstructObjects(data) {
+  const out = []
+  let cur = null
+  for (const obj of data) {
+    const prim = objToPrim(obj)
+    if (!prim) continue
+    const color = obj.color || '#000000'
+    const s = primStart(prim)
+    if (cur && obj.pid != null && obj.pid === cur.pid && color === cur.color &&
+        Math.abs(s.x - cur.end.x) <= LINK_MATCH && Math.abs(s.y - cur.end.y) <= LINK_MATCH) {
+      cur.prims.push(prim)
+      cur.end = primEnd(prim)
+    } else {
+      cur = { category: categorize(color), color, pid: obj.pid, prims: [prim], start: s, end: primEnd(prim) }
+      out.push(cur)
+    }
+  }
+  return out
+}
+
 function reconstructPaths(data) {
   const items = []
   for (const obj of data) {
@@ -1861,22 +1936,78 @@ const TSP_MAX_PASSES = 20
 export const PATH_ORDER_ALGORITHMS = ['file', 'nn', '2opt']
 export const DEFAULT_PATH_ORDER = 'nn'
 
-function nearestNeighbourOrder(paths, startPos) {
-  const pool = [...paths]
-  const seq = []
-  let pos = { ...startPos }
-  while (pool.length) {
-    let best = 0, minD = Infinity, reverse = false
-    for (let i = 0; i < pool.length; i++) {
-      const ds = dist(pos, pool[i].start)
-      const de = dist(pos, pool[i].end)
-      if (ds < minD) { minD = ds; best = i; reverse = false }
-      if (de < minD) { minD = de; best = i; reverse = true }
+// Greedy nearest neighbour by START point: the machine never reverses an
+// object (see reconstructObjects), it picks the object whose start is
+// nearest. Ties go to the object that comes first in the file. A grid over
+// the start points keeps this fast for files with thousands of objects.
+// `allowReverse` (an object may also be entered at its end) is only for the
+// '2opt' what-if order.
+export function nearestNeighbourOrder(paths, startPos, { allowReverse = false } = {}) {
+  if (allowReverse) {
+    const pool = [...paths]
+    const seq = []
+    let pos = { ...startPos }
+    while (pool.length) {
+      let best = 0, minD = Infinity, reverse = false
+      for (let i = 0; i < pool.length; i++) {
+        const ds = dist(pos, pool[i].start)
+        const de = dist(pos, pool[i].end)
+        if (ds < minD) { minD = ds; best = i; reverse = false }
+        if (de < minD) { minD = de; best = i; reverse = true }
+      }
+      let cur = pool.splice(best, 1)[0]
+      if (reverse) cur = reversePath(cur)
+      seq.push(cur)
+      pos = cur.end
     }
-    let cur = pool.splice(best, 1)[0]
-    if (reverse) cur = reversePath(cur)
-    seq.push(cur)
-    pos = cur.end
+    return seq
+  }
+  const n = paths.length
+  if (n === 0) return []
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const p of paths) {
+    minX = Math.min(minX, p.start.x); maxX = Math.max(maxX, p.start.x)
+    minY = Math.min(minY, p.start.y); maxY = Math.max(maxY, p.start.y)
+  }
+  const cs = Math.max(1, Math.sqrt(((maxX - minX) * (maxY - minY)) / n) * 2)
+  const W = Math.floor((maxX - minX) / cs) + 1, H = Math.floor((maxY - minY) / cs) + 1
+  const cells = new Map()
+  paths.forEach((p, i) => {
+    const k = Math.floor((p.start.x - minX) / cs) + W * Math.floor((p.start.y - minY) / cs)
+    if (!cells.has(k)) cells.set(k, [])
+    cells.get(k).push(i)
+  })
+  const seq = []
+  let pos = startPos
+  for (let k = 0; k < n; k++) {
+    const cx = Math.floor((pos.x - minX) / cs), cy = Math.floor((pos.y - minY) / cs)
+    const rMax = Math.max(Math.abs(cx), Math.abs(cx - W), Math.abs(cy), Math.abs(cy - H)) + 1
+    let best = -1, bd = Infinity
+    const visit = (x, y) => {
+      if (x < 0 || y < 0 || x >= W || y >= H) return
+      const list = cells.get(x + W * y)
+      if (!list) return
+      for (const i of list) {
+        const d = dist(pos, paths[i].start)
+        if (d < bd || (d === bd && i < best)) { bd = d; best = i }
+      }
+    }
+    for (let r = 0; r <= rMax; r++) {
+      if (r === 0) visit(cx, cy)
+      else {
+        for (let x = cx - r; x <= cx + r; x++) { visit(x, cy - r); visit(x, cy + r) }
+        for (let y = cy - r + 1; y <= cy + r - 1; y++) { visit(cx - r, y); visit(cx + r, y) }
+      }
+      // Everything in ring r+1 is at least r cells away from pos.
+      if (best >= 0 && bd <= r * cs) break
+    }
+    const p = paths[best]
+    const key = Math.floor((p.start.x - minX) / cs) + W * Math.floor((p.start.y - minY) / cs)
+    const list = cells.get(key)
+    list.splice(list.indexOf(best), 1)
+    if (!list.length) cells.delete(key)
+    seq.push(p)
+    pos = p.end
   }
   return seq
 }
@@ -1912,9 +2043,27 @@ function twoOptImprove(seq, startPos) {
 // real production files. 'nn' is the default.
 function optimizeOrder(paths, startPos, algo = DEFAULT_PATH_ORDER) {
   if (algo === 'file' || paths.length < 2) return paths
-  const seq = nearestNeighbourOrder(paths, startPos)
-  if (algo === 'nn' || seq.length < 4 || seq.length > TSP_MAX_PATHS) return seq
+  if (algo === 'nn') return nearestNeighbourOrder(paths, startPos)
+  const seq = nearestNeighbourOrder(paths, startPos, { allowReverse: true })
+  if (seq.length < 4 || seq.length > TSP_MAX_PATHS) return seq
   return twoOptImprove(seq, startPos)
+}
+
+// Time of one move with the machine's REAL kinematics (calibration.js REALITY):
+// same path, same stops, other speed / acceleration / stop cost. `T` is the
+// move's displayed time; raster keeps it and gets the per-line / per-height
+// correction.
+function realMoveTime(m, poly, forced, T, accel) {
+  if (m.category === 'raster') {
+    return T + (m.rows ? m.rows * (REALITY.rasterPerLine + REALITY.rasterPerMmHeight * m.pitch) : 0)
+  }
+  const travel = m.kind === 'travel'
+  const v = travel ? REALITY.travelSpeed : m.v + REALITY.speedOffset
+  const a = accel > 0 ? REALITY.vectorAccel + REALITY.accelPerSpeed * v : 0
+  const stop = travel ? 0 : Math.max(0, REALITY.stopPenalty + REALITY.stopPenaltyPerSpeed * v)
+  const extra = travel ? (m.home ? 0 : REALITY.vectorStartPenalty)
+    : (m.joined ? CALIBRATION.objectStopPenalty : 0) + (m.vertexStops ? REALITY.fileObjectPenalty : 0)
+  return rampSegments(poly, v, a, stop, forced).total + extra
 }
 
 /**
@@ -1954,7 +2103,10 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
 
   const allPaths = reconstructPaths(data)
   const rasterPaths = allPaths.filter(p => p.category === 'green' || p.category === 'gray')
+  // Connected contours (touching pieces linked): only for counting cut-out parts.
   const vectorPaths = allPaths.filter(p => p.category !== 'green' && p.category !== 'gray')
+  // What the machine drives: the file's objects (reconstructObjects).
+  const vectorObjects = reconstructObjects(data).filter(p => p.category !== 'green' && p.category !== 'gray')
 
   // Raster content: ALL of it - green + grayscale vectors/fills AND grayscale
   // bitmaps, goes into ONE scanline pass. The machine sweeps each row from its
@@ -2029,20 +2181,34 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   // ── Vector phases: red engrave, blue cut, other ───────────────────────────
   let didVector = false
   for (const cat of ['red', 'blue', 'other']) {
-    let group = vectorPaths.filter(p => p.category === cat)
+    let group = vectorObjects.filter(p => p.category === cat).map((p) => ({ ...p, prims: [...p.prims] }))
     if (group.length === 0) continue
 
-    if (pathOrderAlgo !== 'file') group = optimizeOrder(group, lastPos, pathOrderAlgo)
+    if (pathOrderAlgo !== 'file') {
+      group = optimizeOrder(group, lastPos, pathOrderAlgo)
+      // Drives through where the next object starts exactly at this one's end.
+      const merged = []
+      for (const p of group) {
+        const last = merged[merged.length - 1]
+        if (last && Math.abs(last.end.x - p.start.x) <= LINK_MATCH && Math.abs(last.end.y - p.start.y) <= LINK_MATCH) {
+          last.prims.push(...p.prims); last.end = p.end
+        } else merged.push(p)
+      }
+      group = merged
+    }
     // (unoptimised: keep file order)
 
     for (const p of group) {
-      if (dist(lastPos, p.start) > 0.1) {
+      // No travel when the object starts where the last one ended - but the
+      // head still stops there (m.joined, moveExtraTime).
+      const travel = !didVector || dist(lastPos, p.start) > 0.1
+      if (travel && dist(lastPos, p.start) > 0.1) {
         moves.push({ kind: 'travel', color: '#888888', a: { ...lastPos }, b: { ...p.start } })
       }
       // 'file' = the machine's "Optimieren" OFF: file order AND a stop at every
       // straight-line vertex (forcedStopsFor). On: stops only at sharp corners.
       moves.push({ kind: kindOf(cat), color: p.color, category: cat, prims: p.prims,
-                   vertexStops: pathOrderAlgo === 'file' })
+                   vertexStops: pathOrderAlgo === 'file', joined: !travel })
       lastPos = p.end
       didVector = true
     }
@@ -2099,17 +2265,29 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
       tinyBoxes.push(box)
     }
   }
-  let vectorStops = 0   // full stops inside vector contours (REALITY.vectorPerStop)
+  // Speed of every move, and the display constants of the chosen mode: with
+  // "Optimieren" the Job Manager uses its own vector values (calibration.js
+  // `optimized`). `accel` (printer profile) scales with them.
+  const K = pathOrderAlgo !== 'file' && CALIBRATION.optimized ? { ...CALIBRATION, ...CALIBRATION.optimized } : CALIBRATION
+  const a0 = accel > 0 ? accel * (K.vectorAccel / CALIBRATION.vectorAccel) : 0
+  for (const m of moves) {
+    m.v = m.kind === 'travel' ? (speeds.travel || SPEED_MM_S.travel) : speedFor(m)
+    if (m.category === 'raster') continue
+    m.a0 = a0; m.a1 = K.accelPerSpeed
+    if (m.kind === 'travel') m.pv = K.vectorStartPenalty
+    else m.p0 = K.cornerPenalty
+  }
+  let realTime = 0      // the same moves with the machine's REAL kinematics
   for (const m of moves) {
     let L = 0
     if (m.kind === 'travel') L = dist(m.a, m.b)
     else for (const prim of m.prims) L += primLength(prim)
     // Acceleration-aware: ramps at every corner (each scan-line turnaround), so
     // the printer's accel value actually drives the estimate.
-    const ramp = rampSegments(movePolyline(m), speedFor(m), accelFor(m, accel),
-                              cornerPenaltyFor(m), forcedStopsFor(m))
+    const poly = movePolyline(m), forced = forcedStopsFor(m)
+    const ramp = rampSegments(poly, speedFor(m), accelFor(m, accel), cornerPenaltyFor(m), forced)
     const T = ramp.total + moveExtraTime(m)
-    if (m.kind !== 'travel' && m.category !== 'raster') vectorStops += Math.max(0, ramp.runs - 1)
+    realTime += realMoveTime(m, poly, forced, T, accel)
 
     if      (m.kind === 'travel')     { stats.travelLen  += L; stats.travelTime  += T }
     else if (m.kind === 'cut')        { stats.cutLen     += L; stats.cutTime     += T }
@@ -2121,25 +2299,15 @@ export function buildToolpath(data, { optimize = 'file', speeds = SPEED_MM_S, ra
   stats.totalTime += CALIBRATION.jobOverhead
 
   // ── Anzeige → Realität ──────────────────────────────────────────────────
-  // Everything above reproduces what the Job Manager DISPLAYS. The machine's
-  // actual run time differs from it systematically (116 stopwatch runs, see
-  // calibration.js REALITY): raster finishes early, vector with a lot of travel
-  // or many corner stops runs late. stats.displayTime keeps the machine's own
-  // number, stats.totalTime becomes the one that matters - how long the job
-  // really takes.
+  // Everything above reproduces what the Job Manager DISPLAYS (the per-
+  // operation times too). The machine's actual run time differs from it
+  // systematically - see calibration.js REALITY: it accelerates less at high
+  // speed, stops take longer, travel is a bit faster, raster finishes early.
+  // stats.displayTime keeps the machine's own number, stats.totalTime becomes
+  // the one that matters - how long the job really takes.
   stats.displayTime = stats.totalTime
-  let rasterRows = 0, rasterHeight = 0, contours = 0
-  for (const m of moves) {
-    if (m.category === 'raster' && m.rows) { rasterRows += m.rows; rasterHeight += m.rows * m.pitch }
-    else if (m.kind !== 'travel') contours++
-  }
-  stats.realDelta =
-      REALITY.rasterPerLine * rasterRows
-    + REALITY.rasterPerMmHeight * rasterHeight
-    + REALITY.vectorPerContour * contours
-    + REALITY.vectorPerMmTravel * stats.travelLen
-    + REALITY.vectorPerStop * vectorStops
-  stats.totalTime = Math.max(0, stats.displayTime + stats.realDelta)
+  stats.totalTime = Math.max(0, realTime + CALIBRATION.jobOverhead)
+  stats.realDelta = stats.totalTime - stats.displayTime
 
   return { moves, stats, tinyBoxes }
 }
