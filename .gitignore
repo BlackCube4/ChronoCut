@@ -34,4 +34,18 @@ dist-ssr
 *.pyc
 .vercel
 .env*
-/docs
+# docs: only the calibration write-up and the scripts that reproduce it
+/docs/*
+!/docs/CALIBRATION.md
+!/docs/calib/
+/docs/calib/*
+!/docs/calib/fit_all.mjs
+!/docs/calib/verify_all.mjs
+!/docs/calib/extract_kompakt.py
+!/docs/calib/fit_model.py
+!/docs/calib/svg_to_data.mjs
+!/docs/calib/register.mjs
+!/docs/calib/extless.mjs
+
+# Real jobs from other people stay local
+/laser time calibration/real test files/
