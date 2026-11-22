@@ -128,8 +128,8 @@ file.
 
 ## Third-party software
 
-All libraries are under permissive licences, so ChronoCut itself can be
-published under any licence, closed source included. Their licence texts
+All libraries are under permissive licences, which fit ChronoCut's own MIT
+licence. Their licence texts
 must stay with the app (they are in `node_modules/<package>/` and, for the
 files shipped as-is, in `dist/pdfjs/`).
 
@@ -144,3 +144,7 @@ files shipped as-is, in `dist/pdfjs/`).
 | Foxit fonts (shipped by pdf.js) | substitute fonts | BSD-style (PDFium) |
 | Liberation Sans (shipped by pdf.js) | substitute font | GPL 2 with font exception, a separate data file |
 | JBIG2 / OpenJPEG / QCMS decoders (shipped by pdf.js) | rare image formats | BSD / MIT |
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 BlackCube4 and JulianDKal.
