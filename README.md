@@ -99,6 +99,16 @@ and copy the contents of `frontend/dist/` to the web server (including the
 `dist/index.html` directly from disk does not work: browsers only run the PDF
 engine when the page comes from a web server.
 
+## Watermarks
+
+ChronoCut can remove watermarks that would otherwise be engraved or cut along
+with the drawing, for example the "ARCHICAD BILDUNGSVERSION" stamp that
+educational CAD licences put on every page. This only changes the copy that is
+sent to the laser cutter. It is not meant to hide where a drawing comes from or
+to pass off educational-licence output as commercial work; the licence terms of
+your CAD software still apply. Only watermarks stored as text in the file are
+detected, plus the Archicad stamp image.
+
 ## Adding a printer
 
 Printer profiles (machine specs and material presets) are the XML files in
